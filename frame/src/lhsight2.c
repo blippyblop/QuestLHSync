@@ -96,8 +96,11 @@ struct track {
   double last_hit;         /* monotonic s of last real hit */
   int hits;                /* real hits total */
   int n;                   /* samples in ring (long frames) */
-  u8 amp[DFT_WIN];         /* amplitude ring (peak, 0 = absent) */
+  u8 amp[DFT_WIN];         /* amplitude ring, LONG frames (peak, 0 = absent) */
   u8 npx[DFT_WIN];
+  u8 samp[DFT_WIN];        /* SHORT-frame presence ring: peak, 0 = no flash caught */
+  u8 snpx[DFT_WIN];
+  int sn;                  /* short-ring sample count */
   float f0; float q; float pres;   /* last analysis */
   float npema;                     /* mean solid size when present: the brightness rank */
   int tick;                        /* analysis pacing once the ring is full */
@@ -492,16 +495,21 @@ static void analyse(struct cam *c, struct track *tr) {
  * saturated, so the beat lives in the zeros). Once confirmed, the dot is
  * emitted continuously with a LATCH_MISS grace, instead of re-qualifying
  * every frame. */
-static int check_confirm(struct track *tr) {
-  int n = tr->n, lo = tr->n;
-  if (n > MOD_WIN) lo = n - MOD_WIN;
+static int ring_modulated(const u8 *a, const u8 *px, int n) {
+  int lo = n; if (n > MOD_WIN) lo = n - MOD_WIN;
   int present = 0, mx = 0, mn = 256;
   for (int i = lo; i < n; i++) {
-    if (tr->amp[i] > mx) mx = tr->amp[i];
-    if (tr->amp[i] < mn) mn = tr->amp[i];
-    if (tr->amp[i] >= PK_MIN) present++;
+    if (a[i] > mx) mx = a[i];
+    if (a[i] < mn) mn = a[i];
+    if (a[i] >= PK_MIN) present++;
   }
   return present >= MOD_PRESENT && mx - mn >= MOD_SWING;
+}
+
+static int check_confirm(struct track *tr) {
+  if (tr->n >= MOD_PRESENT && ring_modulated(tr->amp, tr->npx, tr->n)) return 1;
+  if (tr->sn >= 8 && ring_modulated(tr->samp, tr->snpx, tr->sn)) return 1;   /* sparse hits need fewer samples */
+  return 0;
 }
 
 static double last_confirmlog;
@@ -514,7 +522,7 @@ static void track_confirm(struct cam *c, struct track *tr) {
   }
 }
 
-static void track_update(struct cam *c, double t, const u64 *sx, const u64 *sy, const u32 *np, const int *pk, int nbl) {
+static void track_update(struct cam *c, double t, const u64 *sx, const u64 *sy, const u32 *np, const int *pk, int nbl, int cls) {
   struct track *tr;
   u8 taken[MAXTRACKS] = {0};
   /* age out dead tracks */
@@ -544,21 +552,31 @@ static void track_update(struct cam *c, double t, const u64 *sx, const u64 *sy, 
     best->x += 0.3f*(bx-best->x); best->y += 0.3f*(by-best->y);
     best->last_hit = t; best->hits++;
     /* push amplitude sample (one per long frame) */
-    if (best->n < DFT_WIN) { best->amp[best->n] = (u8)(pkv > 255 ? 255 : pkv); best->npx[best->n] = (u8)(npx > 255 ? 255 : npx); best->n++; }
-    else { memmove(best->amp, best->amp+1, DFT_WIN-1); memmove(best->npx, best->npx+1, DFT_WIN-1); best->amp[DFT_WIN-1] = (u8)pkv; best->npx[DFT_WIN-1] = (u8)(npx>255?255:npx); }
+    if (cls == 0) {
+      if (best->n < DFT_WIN) { best->amp[best->n] = (u8)(pkv > 255 ? 255 : pkv); best->npx[best->n] = (u8)(npx > 255 ? 255 : npx); best->n++; }
+      else { memmove(best->amp, best->amp+1, DFT_WIN-1); memmove(best->npx, best->npx+1, DFT_WIN-1); best->amp[DFT_WIN-1] = (u8)pkv; best->npx[DFT_WIN-1] = (u8)(npx>255?255:npx); }
+    } else {
+      if (best->sn < DFT_WIN) { best->samp[best->sn] = (u8)(pkv > 255 ? 255 : pkv); best->snpx[best->sn] = (u8)(npx > 255 ? 255 : npx); best->sn++; }
+      else { memmove(best->samp, best->samp+1, DFT_WIN-1); memmove(best->snpx, best->snpx+1, DFT_WIN-1); best->samp[DFT_WIN-1] = (u8)pkv; best->snpx[DFT_WIN-1] = (u8)(npx>255?255:npx); }
+    }
     track_confirm(c, best);
-    if (best->n == DFT_MIN || (best->n % DFT_STEP == 0 && best->n < DFT_WIN) ||
-        (best->n == DFT_WIN && (++best->tick & 15) == 0)) analyse(c, best);
+    if (cls == 0 && (best->n == DFT_MIN || (best->n % DFT_STEP == 0 && best->n < DFT_WIN) ||
+        (best->n == DFT_WIN && (++best->tick & 15) == 0))) analyse(c, best);
   }
   /* absent tracks get a 0 sample so presence stats work */
   for (int i = 0; i < MAXTRACKS; i++) {
     tr = &c->tr[i];
     if (!tr->used || taken[i]) continue;
     if (tr->confirmed && t - tr->last_hit > LATCH_MISS) tr->confirmed = 0;
-    if (tr->n < DFT_WIN) { tr->amp[tr->n] = 0; tr->npx[tr->n] = 0; tr->n++; }
-    else { memmove(tr->amp, tr->amp+1, DFT_WIN-1); memmove(tr->npx, tr->npx+1, DFT_WIN-1); tr->amp[DFT_WIN-1] = 0; tr->npx[DFT_WIN-1] = 0; }
-    if (tr->n == DFT_MIN || (tr->n % DFT_STEP == 0 && tr->n < DFT_WIN) ||
-        (tr->n == DFT_WIN && (++tr->tick & 15) == 0)) analyse(c, tr);
+    if (cls == 0) {
+      if (tr->n < DFT_WIN) { tr->amp[tr->n] = 0; tr->npx[tr->n] = 0; tr->n++; }
+      else { memmove(tr->amp, tr->amp+1, DFT_WIN-1); memmove(tr->npx, tr->npx+1, DFT_WIN-1); tr->amp[DFT_WIN-1] = 0; tr->npx[DFT_WIN-1] = 0; }
+    } else {
+      if (tr->sn < DFT_WIN) { tr->samp[tr->sn] = 0; tr->snpx[tr->sn] = 0; tr->sn++; }
+      else { memmove(tr->samp, tr->samp+1, DFT_WIN-1); memmove(tr->snpx, tr->snpx+1, DFT_WIN-1); tr->samp[DFT_WIN-1] = 0; tr->snpx[DFT_WIN-1] = 0; }
+    }
+    if (cls == 0 && (tr->n == DFT_MIN || (tr->n % DFT_STEP == 0 && tr->n < DFT_WIN) ||
+        (tr->n == DFT_WIN && (++tr->tick & 15) == 0))) analyse(c, tr);
   }
 }
 
@@ -626,8 +644,38 @@ static void frame(int k, int i, const struct v4l2_buffer *b) {
   if (torn(c, i, b)) return;
 
   if (is_short) {
-    /* short frame: keep the cadence visible to the PC, no blobs */
-    out("F %d %u %llu %d -1", k, b->sequence, (unsigned long long)t_us, mean);
+    /* SHORT frames: the sweep train lands in only ~10% of them, but the
+     * hit/dropout pattern is the same rotor beat, and unlike the long side
+     * it never saturates away. Track and confirm on it too. */
+    for (int y = 0; y < c->h; y++) memcpy(scratch + (size_t)y*c->w, p + (size_t)y*c->stride, c->w);
+  }
+  cpu_access(c->fd[i], 1);
+  if (torn(c, i, b)) return;
+
+  if (is_short) {
+    u64 sx2[MAXB], sy2[MAXB]; u32 np2[MAXB]; int pk2[MAXB]; u32 sat2[MAXB];
+    int T2 = mean*4/10; if (T2 < 64) T2 = 64;
+    int nc2 = (c->w>>4)*(c->h>>4);
+    memset(hot, 0, (size_t)nc2);
+    int nbl2 = blobs(c->w, c->h, 250, 1, 0, sx2, sy2, np2, pk2, sat2);
+    if (T2 < 250) nbl2 = blobs(c->w, c->h, T2, 0, nbl2, sx2, sy2, np2, pk2, sat2);
+    track_update(c, t_us/1e6, sx2, sy2, np2, pk2, nbl2, 1);
+    /* emit dots of tracks confirmed via either stream */
+    char bl2[1800] = {0}; int L3 = 0, n2 = 0;
+    for (int i2 = 0; i2 < MAXTRACKS; i2++) {
+      struct track *tr = &c->tr[i2];
+      if (!tr->used || !tr->confirmed) continue;
+      for (int e = 0; e < nbl2; e++) {
+        float bx = sx2[e]/10.0f, by = sy2[e]/10.0f;
+        float dx = tr->x-bx, dy = tr->y-by;
+        if (dx*dx+dy*dy > RADIUS2) continue;
+        L3 += snprintf(bl2+L3, sizeof bl2-L3, " %lld %lld %u %d", (long long)sx2[e]/np2[e], (long long)sy2[e]/np2[e], np2[e], pk2[e]);
+        n2++;
+        break;
+      }
+      if (L3 > (int)sizeof bl2 - 64) break;
+    }
+    out("F %d %u %llu %d %d%s", k, b->sequence, (unsigned long long)t_us, mean, n2, bl2);
     return;
   }
   c->longs++;
@@ -644,7 +692,7 @@ static void frame(int k, int i, const struct v4l2_buffer *b) {
   if (c->nlfts < 32) c->lfts[c->nlfts++] = tn;
   else { memmove(c->lfts, c->lfts+1, 31*sizeof *c->lfts); c->lfts[31] = tn; }
   check_rate(c);
-  track_update(c, tn, sx, sy, np, pk, nbl);
+  track_update(c, tn, sx, sy, np, pk, nbl, 0);
   /* Confirmed-modulated tracks only, brightest first (mean solid core),
    * top 3 per camera: the aperture outranks its own wall spatter by a wide
    * margin, lamps never confirm (no swing), and the latch keeps a confirmed
