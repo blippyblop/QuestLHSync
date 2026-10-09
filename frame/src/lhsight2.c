@@ -693,41 +693,25 @@ static void frame(int k, int i, const struct v4l2_buffer *b) {
   else { memmove(c->lfts, c->lfts+1, 31*sizeof *c->lfts); c->lfts[31] = tn; }
   check_rate(c);
   track_update(c, tn, sx, sy, np, pk, nbl, 0);
-  /* Confirmed-modulated tracks only, brightest first (mean solid core),
-   * top 3 per camera: the aperture outranks its own wall spatter by a wide
-   * margin, lamps never confirm (no swing), and the latch keeps a confirmed
-   * dot flowing through brief association gaps. */
-  struct rk { struct track *tr; float sc; } rk[MAXTRACKS];
-  int nr = 0;
-  for (int i2 = 0; i2 < MAXTRACKS; i2++) {
-    struct track *tr = &c->tr[i2];
-    if (!tr->used || !tr->confirmed) continue;
-    float sum = 0; int cnt = 0;
-    for (int i = 0; i < tr->n; i++)
-      if (tr->amp[i] >= PK_MIN) { sum += tr->npx[i]; cnt++; }
-    if (!cnt) continue;
-    rk[nr].tr = tr; rk[nr].sc = sum/cnt; nr++;
+  /* Raw emission of every saturated-core blob, brightest first. The frame is
+   * a sensor, not a classifier: the PC pairs each dot with the SLAM pose at
+   * exposure time and its geometric gates decide what is a base station.
+   * Temporal filtering here only starves it. The beat analysis runs as B
+   * diagnostics. */
+  int cand[MAXB], nc2 = 0;
+  for (int e = 0; e < nbl; e++) {
+    if (pk[e] < 250 || (int)np[e] > 150 || sat[e] < 4) continue;
+    cand[nc2++] = e;
   }
-  for (int a = 1; a < nr; a++) {
-    struct rk v = rk[a]; int b2 = a-1;
-    while (b2 >= 0 && rk[b2].sc < v.sc) { rk[b2+1] = rk[b2]; b2--; }
-    rk[b2+1] = v;
+  for (int a = 1; a < nc2; a++) {
+    int v = cand[a], b2 = a-1;
+    while (b2 >= 0 && sat[cand[b2]] < sat[v]) { cand[b2+1] = cand[b2]; b2--; }
+    cand[b2+1] = v;
   }
-  /* emit ALL confirmed tracks: ray volume is what the solver's RANSAC needs
-   * (supports of 1-4 vs the 30+ a raw session reached); the modulation
-   * filter already removed lamps/static, and the PC gates the rest. */
   char bl[1800] = {0}; int L2 = 0, n = 0;
-  for (int r2 = 0; r2 < nr; r2++) {
-    struct track *tr = rk[r2].tr;
-    for (int e = 0; e < nbl; e++) {
-      float bx = sx[e]/10.0f, by = sy[e]/10.0f;
-      float dx = tr->x-bx, dy = tr->y-by;
-      if (dx*dx+dy*dy > RADIUS2) continue;
-      L2 += snprintf(bl+L2, sizeof bl-L2, " %lld %lld %u %d", (long long)sx[e]/np[e], (long long)sy[e]/np[e], np[e], pk[e]);
-      n++;
-      break;
-    }
-    if (L2 > (int)sizeof bl - 64) break;
+  for (int e = 0; e < nc2 && n < 16; e++) {
+    L2 += snprintf(bl+L2, sizeof bl-L2, " %lld %lld %u %d", (long long)sx[cand[e]]/np[cand[e]], (long long)sy[cand[e]]/np[cand[e]], np[cand[e]], pk[cand[e]]);
+    n++;
   }
   out("F %d %u %llu %d %d%s", k, b->sequence, (unsigned long long)t_us, mean, n, bl);
 }
