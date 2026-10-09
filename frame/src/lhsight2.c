@@ -659,23 +659,13 @@ static void frame(int k, int i, const struct v4l2_buffer *b) {
     memset(hot, 0, (size_t)nc2);
     int nbl2 = blobs(c->w, c->h, 250, 1, 0, sx2, sy2, np2, pk2, sat2);
     if (T2 < 250) nbl2 = blobs(c->w, c->h, T2, 0, nbl2, sx2, sy2, np2, pk2, sat2);
-    track_update(c, t_us/1e6, sx2, sy2, np2, pk2, nbl2, 1);
-    /* emit dots of tracks confirmed via either stream */
-    char bl2[1800] = {0}; int L3 = 0, n2 = 0;
-    for (int i2 = 0; i2 < MAXTRACKS; i2++) {
-      struct track *tr = &c->tr[i2];
-      if (!tr->used || !tr->confirmed) continue;
-      for (int e = 0; e < nbl2; e++) {
-        float bx = sx2[e]/10.0f, by = sy2[e]/10.0f;
-        float dx = tr->x-bx, dy = tr->y-by;
-        if (dx*dx+dy*dy > RADIUS2) continue;
-        L3 += snprintf(bl2+L3, sizeof bl2-L3, " %lld %lld %u %d", (long long)sx2[e]/np2[e], (long long)sy2[e]/np2[e], np2[e], pk2[e]);
-        n2++;
-        break;
-      }
-      if (L3 > (int)sizeof bl2 - 64) break;
-    }
-    out("F %d %u %llu %d %d%s", k, b->sequence, (unsigned long long)t_us, mean, n2, bl2);
+    track_update(c, t_us/1e6, sx2, sy2, np2, pk2, nbl2, 1);   /* confirmation diagnostics only */
+    /* Single-class emission: the PC's FrameGrid/lag model was built for the
+     * Quest, where dots come from ONE camera sub-frame class. Emitting both
+     * classes mixes their 8.4 ms phase offset into the grid and offsets the
+     * pose lookup for half the dots. Longs only. */
+    out("F %d %u %llu %d -1", k, b->sequence, (unsigned long long)t_us, mean);
+    return;out("F %d %u %llu %d %d%s", k, b->sequence, (unsigned long long)t_us, mean, n2, bl2);
     return;
   }
   c->longs++;
