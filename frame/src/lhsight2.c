@@ -97,6 +97,7 @@ struct track {
   float f0; float q; float pres;   /* last analysis */
   float npema;                     /* mean solid size when present: the brightness rank */
   int tick;                        /* analysis pacing once the ring is full */
+  int emitted;                     /* dots sent for this track (diagnostic log gate) */
   double since_classified;
 };
 
@@ -549,16 +550,7 @@ static int track_modulated(const struct track *tr) {
     if (tr->amp[i] > mx) mx = tr->amp[i];
     if (tr->amp[i] < mn) mn = tr->amp[i];
   }
-  return present >= 3 && mx - mn >= 64;
-}
-
-/* 2. brightness rank: mean solid core size over the samples where present */
-static float track_bright(const struct track *tr) {
-  int n = tr->n, lo = tr->n; if (n > 16) lo = n-16;
-  float sum = 0; int cnt = 0;
-  for (int i = lo; i < n; i++)
-    if (tr->amp[i] >= PK_MIN) { sum += tr->npx[i]; cnt++; }
-  return cnt ? sum/cnt : 0;
+  return present >= 2 && mx - mn >= 48;
 }
 
 static void frame(int k, int i, const struct v4l2_buffer *b) {
@@ -614,36 +606,29 @@ static void frame(int k, int i, const struct v4l2_buffer *b) {
   else { memmove(c->lfts, c->lfts+1, 31*sizeof *c->lfts); c->lfts[31] = tn; }
   check_rate(c);
   track_update(c, tn, sx, sy, np, pk, nbl);
-  /* 1. modulated sources first: keep tracks whose brightness visibly swings
-   *    (rotor sweeps and their spatter; not static lamps or rig glow).
-   * 2. then sort by brightness (mean solid core) and emit the brightest 3 --
-   *    the aperture outranks its own spatter by a wide margin. The PC's
-   *    geometric gates classify what arrives. */
-  struct rk { struct track *tr; float sc; } rk[MAXTRACKS];
-  int nr = 0;
+  /* DIAGNOSTIC MODE: brightness ranking off. Every modulated track's dot
+   * goes out, brightest or not, so we can see whether modulation alone
+   * finds the stations. Each track's first emission is logged. */
+  static double last_modlog;
+  char bl[1800] = {0}; int L2 = 0, n = 0;
   for (int i2 = 0; i2 < MAXTRACKS; i2++) {
     struct track *tr = &c->tr[i2];
     if (!tr->used || !track_modulated(tr)) continue;
-    rk[nr].tr = tr; rk[nr].sc = track_bright(tr); nr++;
-  }
-  for (int a = 1; a < nr; a++) {
-    struct rk v = rk[a]; int b2 = a-1;
-    while (b2 >= 0 && rk[b2].sc < v.sc) { rk[b2+1] = rk[b2]; b2--; }
-    rk[b2+1] = v;
-  }
-  if (nr > 3) nr = 3;
-  char bl[1800] = {0}; int L2 = 0, n = 0;
-  for (int r2 = 0; r2 < nr; r2++) {
-    struct track *tr = rk[r2].tr;
     for (int e = 0; e < nbl; e++) {
       float bx = sx[e]/10.0f, by = sy[e]/10.0f;
       float dx = tr->x-bx, dy = tr->y-by;
       if (dx*dx+dy*dy > RADIUS2) continue;
-      L2 += snprintf(bl+L2, sizeof bl-L2, " %lld %lld %u %d", (long long)sx[e]/np[e], (long long)sy[e]/np[e], np[e], pk[e]);
-      n++;
+      if (L2 < (int)sizeof bl - 96) {
+        L2 += snprintf(bl+L2, sizeof bl-L2, " %lld %lld %u %d", (long long)sx[e]/np[e], (long long)sy[e]/np[e], np[e], pk[e]);
+        n++;
+      }
+      if (tr->emitted++ == 0 && now_s(CLOCK_MONOTONIC) - last_modlog > 1.0) {
+        last_modlog = now_s(CLOCK_MONOTONIC);
+        out("I cam%d track %d modulated: hits %d, emitting at (%.1f,%.1f)", (int)(c-C), tr->id, tr->hits, tr->x, tr->y);
+      }
       break;
     }
-    if (L2 > (int)sizeof bl - 64) break;
+    if (L2 > (int)sizeof bl - 96) break;
   }
   out("F %d %u %llu %d %d%s", k, b->sequence, (unsigned long long)t_us, mean, n, bl);
 }
