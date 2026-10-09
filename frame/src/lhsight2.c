@@ -117,6 +117,7 @@ struct cam {
   double lfts[32];         /* recent long-frame times (s): the real sample rate */
   int nlfts;
   int nlfts_reported;
+  float last_fs;           /* the rate check_rate() last saw (mode-switch detect) */
 };
 static struct cam C[NCAM];
 static u8 *scratch;
@@ -404,6 +405,25 @@ static int spectral_test(const u8 *amp, int n, float fs, float fmin, float fstep
   return q >= q_min && stable && pres >= PRES_MIN && !nyquist;
 }
 
+/* flicker-mode switches step the long-frame rate between ~30.0 and ~33.3 Hz:
+ * samples taken across the switch don't share a spectrum, so drop everything
+ * and relearn instead of classifying through the seam. */
+static void check_rate(struct cam *c) {
+  float fs = longfps(c);
+  if (fs <= 0) return;
+  if (c->last_fs && fabsf(fs - c->last_fs) > 1.5f) {
+    for (int i = 0; i < MAXTRACKS; i++) {
+      struct track *tr = &c->tr[i];
+      if (tr->used && tr->state == T_ACTIVE)
+        out("I cam%d track %d dropped (frame rate changed)", (int)(c-C), tr->id);
+      tr->used = 0;
+    }
+    c->nlfts = 0;
+    out("I cam%d frame rate changed %.2f -> %.2f Hz (flicker mode switch?): relearning", (int)(c-C), c->last_fs, fs);
+  }
+  c->last_fs = fs;
+}
+
 static void analyse(struct cam *c, struct track *tr) {
   if (tr->n < DFT_MIN || tr->hits < MIN_HITS) return;
   float fs = longfps(c);
@@ -549,6 +569,7 @@ static void frame(int k, int i, const struct v4l2_buffer *b) {
   double tn = t_us/1e6;
   if (c->nlfts < 32) c->lfts[c->nlfts++] = tn;
   else { memmove(c->lfts, c->lfts+1, 31*sizeof *c->lfts); c->lfts[31] = tn; }
+  check_rate(c);
   track_update(c, tn, sx, sy, np, pk, nbl);
   /* emit only classified tracks' blobs, with the stock nb field */
   char bl[1800] = {0}; int L2 = 0, n = 0;
