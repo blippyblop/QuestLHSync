@@ -644,28 +644,8 @@ static void frame(int k, int i, const struct v4l2_buffer *b) {
   if (torn(c, i, b)) return;
 
   if (is_short) {
-    /* SHORT frames: the sweep train lands in only ~10% of them, but the
-     * hit/dropout pattern is the same rotor beat, and unlike the long side
-     * it never saturates away. Track and confirm on it too. */
-    for (int y = 0; y < c->h; y++) memcpy(scratch + (size_t)y*c->w, p + (size_t)y*c->stride, c->w);
-  }
-  cpu_access(c->fd[i], 1);
-  if (torn(c, i, b)) return;
-
-  if (is_short) {
-    u64 sx2[MAXB], sy2[MAXB]; u32 np2[MAXB]; int pk2[MAXB]; u32 sat2[MAXB];
-    int T2 = mean*4/10; if (T2 < 64) T2 = 64;
-    int nc2 = (c->w>>4)*(c->h>>4);
-    memset(hot, 0, (size_t)nc2);
-    int nbl2 = blobs(c->w, c->h, 250, 1, 0, sx2, sy2, np2, pk2, sat2);
-    if (T2 < 250) nbl2 = blobs(c->w, c->h, T2, 0, nbl2, sx2, sy2, np2, pk2, sat2);
-    track_update(c, t_us/1e6, sx2, sy2, np2, pk2, nbl2, 1);   /* confirmation diagnostics only */
-    /* Single-class emission: the PC's FrameGrid/lag model was built for the
-     * Quest, where dots come from ONE camera sub-frame class. Emitting both
-     * classes mixes their 8.4 ms phase offset into the grid and offsets the
-     * pose lookup for half the dots. Longs only. */
+    /* LONG-FRAMES-ONLY TEST: shorts are not scanned or tracked at all. */
     out("F %d %u %llu %d -1", k, b->sequence, (unsigned long long)t_us, mean);
-    return;out("F %d %u %llu %d %d%s", k, b->sequence, (unsigned long long)t_us, mean, n2, bl2);
     return;
   }
   c->longs++;
