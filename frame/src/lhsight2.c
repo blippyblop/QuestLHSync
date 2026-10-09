@@ -118,6 +118,7 @@ struct cam {
   int nlfts;
   int nlfts_reported;
   float last_fs;           /* the rate check_rate() last saw (mode-switch detect) */
+  float cand_fs; int cand_n;
 };
 static struct cam C[NCAM];
 static u8 *scratch;
@@ -407,21 +408,29 @@ static int spectral_test(const u8 *amp, int n, float fs, float fmin, float fstep
 
 /* flicker-mode switches step the long-frame rate between ~30.0 and ~33.3 Hz:
  * samples taken across the switch don't share a spectrum, so drop everything
- * and relearn instead of classifying through the seam. */
+ * and relearn instead of classifying through the seam. Dropped frames can also
+ * halve the measured rate (15 Hz) — that is NOT a mode switch, so only rates
+ * that look like a real mode, confirmed on consecutive checks, flush. */
 static void check_rate(struct cam *c) {
   float fs = longfps(c);
   if (fs <= 0) return;
-  if (c->last_fs && fabsf(fs - c->last_fs) > 1.5f) {
-    for (int i = 0; i < MAXTRACKS; i++) {
-      struct track *tr = &c->tr[i];
-      if (tr->used && tr->state == T_ACTIVE)
-        out("I cam%d track %d dropped (frame rate changed)", (int)(c-C), tr->id);
-      tr->used = 0;
-    }
-    c->nlfts = 0;
-    out("I cam%d frame rate changed %.2f -> %.2f Hz (flicker mode switch?): relearning", (int)(c-C), c->last_fs, fs);
+  int plausible = (fs > 28.5f && fs < 31.5f) || (fs > 32.3f && fs < 34.3f);
+  int changed = c->last_fs && fabsf(fs - c->last_fs) > 1.5f;
+  if (!changed) { c->last_fs = fs; c->cand_n = 0; return; }
+  int confirmed = 0;
+  if (plausible && c->cand_fs == fs) confirmed = ++c->cand_n >= 2;
+  else { c->cand_fs = fs; c->cand_n = 1; }
+  if (!confirmed) return;
+  for (int i = 0; i < MAXTRACKS; i++) {
+    struct track *tr = &c->tr[i];
+    if (tr->used && tr->state == T_ACTIVE)
+      out("I cam%d track %d dropped (frame rate changed)", (int)(c-C), tr->id);
+    tr->used = 0;
   }
+  c->nlfts = 0;
+  out("I cam%d frame rate changed %.2f -> %.2f Hz (flicker mode switch?): relearning", (int)(c-C), c->last_fs, fs);
   c->last_fs = fs;
+  c->cand_n = 0;
 }
 
 static void analyse(struct cam *c, struct track *tr) {
@@ -571,20 +580,17 @@ static void frame(int k, int i, const struct v4l2_buffer *b) {
   else { memmove(c->lfts, c->lfts+1, 31*sizeof *c->lfts); c->lfts[31] = tn; }
   check_rate(c);
   track_update(c, tn, sx, sy, np, pk, nbl);
-  /* emit only classified tracks' blobs, with the stock nb field */
+  /* Emit every plausible lighthouse-sized blob, unclassified: the PC pairs
+   * each dot with the SLAM pose at exposure time and its station gates do the
+   * real classification — pixel-space tracks can't survive head motion (24 px
+   * is ~2 frames of a 60 deg/s turn), and gating emission on a 5 s beat fit
+   * meant nothing moved while worn. The beat analysis stays up purely as B
+   * diagnostics. */
   char bl[1800] = {0}; int L2 = 0, n = 0;
-  for (int i2 = 0; i2 < MAXTRACKS; i2++) {
-    struct track *tr = &c->tr[i2];
-    if (!tr->used || tr->state != T_ACTIVE) continue;
-    for (int e = 0; e < nbl; e++) {
-      float bx = sx[e]/10.0f, by = sy[e]/10.0f;
-      float dx = tr->x-bx, dy = tr->y-by;
-      if (dx*dx+dy*dy > RADIUS2) continue;
-      L2 += snprintf(bl+L2, sizeof bl-L2, " %lld %lld %u %d", (long long)sx[e]/np[e], (long long)sy[e]/np[e], np[e], pk[e]);
-      n++;
-      break;
-    }
-    if (L2 > (int)sizeof bl - 64) break;
+  for (int e = 0; e < nbl && n < 24; e++) {
+    if (pk[e] < 200 || (int)np[e] > 150 || !np[e]) continue;
+    L2 += snprintf(bl+L2, sizeof bl-L2, " %lld %lld %u %d", (long long)sx[e]/np[e], (long long)sy[e]/np[e], np[e], pk[e]);
+    n++;
   }
   out("F %d %u %llu %d %d%s", k, b->sequence, (unsigned long long)t_us, mean, n, bl);
 }
