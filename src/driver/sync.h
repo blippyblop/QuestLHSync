@@ -453,8 +453,20 @@ class Sync {
   };
   Status GetStatus(double now);
   // the cameras' bright spots so far, and what became of them
-  struct Spots { long frames = 0, seen = 0, used = 0, still = 0, fast = 0, big = 0, other = 0, dim = 0; };
+  struct Spots { long frames = 0, seen = 0, used = 0, still = 0, fast = 0, big = 0, other = 0, dim = 0, cellskip = 0; };
   Spots spots() { std::lock_guard<std::mutex> g(net_); return spots_; }
+  // per-world-direction dot history (PC-side presence check): a laser dot is
+  // present in ~0.7-0.8 of the frames its direction was in view (the rotor
+  // sweeps miss the exposure window at the beat period); a lamp or window is
+  // ~1.0 and always saturated. Measured first, gated conservatively.
+  struct SpotCell { int cam = 0; V3 w; long seen = 0, vis = 0; float amax = 0, amin = 1e9f; double last = 0; bool lit = false; };
+  std::map<uint64_t, SpotCell> cells_;
+  double cells_next_ = 0;
+  long cells_dropped_ = 0;
+  static uint64_t CellKey(int cam, const V3 &w);
+  void CellsFrame(int cam, const M3 &R, double t);
+  void CellSeen(int cam, const V3 &w, float peak, double t);
+  void CellsSweep(double t);
   static std::string Describe(const Spots &from, const Spots &to);
   void StationsForDump(std::vector<std::string> &keys, std::vector<V3> &S) const {  // tools
     std::vector<V3> Z;
