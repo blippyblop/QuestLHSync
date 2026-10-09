@@ -46,7 +46,7 @@ def main():
     driver = os.path.join(BUILD, "driver_questlhsync_frame.so")
     subprocess.run([*cc, "-O2", "-Wall", f'-DMODULE_VERSION="{VERSION}"', f"-I{HEADSET}",
                     os.path.join(HEADSET, "lhsyncd.c"), os.path.join(HERE, "src", "frame.c"),
-                    os.path.join(HERE, "src", "lhsight.c"), "-s", "-o", daemon], check=True)
+                    os.path.join(HERE, "src", "lhsight2.c"), "-lm", "-s", "-o", daemon], check=True)
     subprocess.run([*cxx, "-std=c++17", "-O2", "-Wall", "-fPIC", "-shared", "-fvisibility=hidden",
                     f"-I{os.path.join(ROOT, 'third_party', 'openvr', 'headers')}", os.path.join(HERE, "driver", "xrfds.cpp"),
                     "-pthread", "-s", "-o", driver], check=True)
