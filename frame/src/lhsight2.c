@@ -665,7 +665,9 @@ static void frame(int k, int i, const struct v4l2_buffer *b) {
     while (b2 >= 0 && rk[b2].sc < v.sc) { rk[b2+1] = rk[b2]; b2--; }
     rk[b2+1] = v;
   }
-  if (nr > 3) nr = 3;
+  /* emit ALL confirmed tracks: ray volume is what the solver's RANSAC needs
+   * (supports of 1-4 vs the 30+ a raw session reached); the modulation
+   * filter already removed lamps/static, and the PC gates the rest. */
   char bl[1800] = {0}; int L2 = 0, n = 0;
   for (int r2 = 0; r2 < nr; r2++) {
     struct track *tr = rk[r2].tr;
