@@ -534,6 +534,33 @@ static int torn(struct cam *c, int i, const struct v4l2_buffer *b) {
   ntorn++;
   return 1;
 }
+/* 1. is this dot MODULATED? Not the full spectral fit — just: over the last
+ * few samples its brightness visibly swings. The lighthouse dot pulses with
+ * the rotor sweeps; spatter pulses too (it passes — brightness ranks it);
+ * static lamps, rig glow and scene specks don't swing at all. Works worn:
+ * it needs only a handful of samples and no frame-grid assumptions. */
+static int track_modulated(const struct track *tr) {
+  int n = tr->n, lo = tr->n;
+  if (n > 16) lo = n-16;
+  int present = 0, mx = 0, mn = 256;
+  for (int i = lo; i < n; i++) {
+    if (tr->amp[i] < PK_MIN) continue;
+    present++;
+    if (tr->amp[i] > mx) mx = tr->amp[i];
+    if (tr->amp[i] < mn) mn = tr->amp[i];
+  }
+  return present >= 3 && mx - mn >= 64;
+}
+
+/* 2. brightness rank: mean solid core size over the samples where present */
+static float track_bright(const struct track *tr) {
+  int n = tr->n, lo = tr->n; if (n > 16) lo = n-16;
+  float sum = 0; int cnt = 0;
+  for (int i = lo; i < n; i++)
+    if (tr->amp[i] >= PK_MIN) { sum += tr->npx[i]; cnt++; }
+  return cnt ? sum/cnt : 0;
+}
+
 static void frame(int k, int i, const struct v4l2_buffer *b) {
   struct cam *c = &C[k];
   double ts = b->timestamp.tv_sec + b->timestamp.tv_usec/1e6;
@@ -587,26 +614,38 @@ static void frame(int k, int i, const struct v4l2_buffer *b) {
   else { memmove(c->lfts, c->lfts+1, 31*sizeof *c->lfts); c->lfts[31] = tn; }
   check_rate(c);
   track_update(c, tn, sx, sy, np, pk, nbl);
-  /* Brightness/intensity gate, then raw emission: the aperture saturates a
-   * SOLID core of pixels (>= 4 px at 250+), while laser spatter on walls is
-   * dimmer and sparser and lamp blooms are huge. Brightest cores first; the
-   * PC's geometric gates classify. The beat analysis runs as B diagnostics. */
-  int cand[MAXB], nc2 = 0;
-  for (int e = 0; e < nbl; e++) {
-    if (pk[e] < 250 || (int)np[e] > 150 || sat[e] < 4) continue;
-    cand[nc2++] = e;
+  /* 1. modulated sources first: keep tracks whose brightness visibly swings
+   *    (rotor sweeps and their spatter; not static lamps or rig glow).
+   * 2. then sort by brightness (mean solid core) and emit the brightest 3 --
+   *    the aperture outranks its own spatter by a wide margin. The PC's
+   *    geometric gates classify what arrives. */
+  struct rk { struct track *tr; float sc; } rk[MAXTRACKS];
+  int nr = 0;
+  for (int i2 = 0; i2 < MAXTRACKS; i2++) {
+    struct track *tr = &c->tr[i2];
+    if (!tr->used || !track_modulated(tr)) continue;
+    rk[nr].tr = tr; rk[nr].sc = track_bright(tr); nr++;
   }
-  for (int a = 1; a < nc2; a++) {
-    int v = cand[a], b2 = a-1;
-    while (b2 >= 0 && sat[cand[b2]] < sat[v]) { cand[b2+1] = cand[b2]; b2--; }
-    cand[b2+1] = v;
+  for (int a = 1; a < nr; a++) {
+    struct rk v = rk[a]; int b2 = a-1;
+    while (b2 >= 0 && rk[b2].sc < v.sc) { rk[b2+1] = rk[b2]; b2--; }
+    rk[b2+1] = v;
   }
+  if (nr > 3) nr = 3;
   char bl[1800] = {0}; int L2 = 0, n = 0;
-  for (int e = 0; e < nc2 && n < 16; e++) {
-    L2 += snprintf(bl+L2, sizeof bl-L2, " %lld %lld %u %d", (long long)sx[cand[e]]/np[cand[e]], (long long)sy[cand[e]]/np[cand[e]], np[cand[e]], pk[cand[e]]);
-    n++;
+  for (int r2 = 0; r2 < nr; r2++) {
+    struct track *tr = rk[r2].tr;
+    for (int e = 0; e < nbl; e++) {
+      float bx = sx[e]/10.0f, by = sy[e]/10.0f;
+      float dx = tr->x-bx, dy = tr->y-by;
+      if (dx*dx+dy*dy > RADIUS2) continue;
+      L2 += snprintf(bl+L2, sizeof bl-L2, " %lld %lld %u %d", (long long)sx[e]/np[e], (long long)sy[e]/np[e], np[e], pk[e]);
+      n++;
+      break;
+    }
+    if (L2 > (int)sizeof bl - 64) break;
   }
-out("F %d %u %llu %d %d%s", k, b->sequence, (unsigned long long)t_us, mean, n, bl);
+  out("F %d %u %llu %d %d%s", k, b->sequence, (unsigned long long)t_us, mean, n, bl);
 }
 static void poll_camera(int k) {
   struct cam *c = &C[k];
