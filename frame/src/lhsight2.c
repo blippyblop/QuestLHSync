@@ -279,7 +279,7 @@ static int smean(const struct cam *c, const u8 *p) {
 
 /* ---------------------------------------------------------------- blobs */
 static int find(int x) { while (lab[x] != x) { lab[x] = lab[lab[x]]; x = lab[x]; } return x; }
-static int blobs(int w, int h, int T, int mark, int nbl, u64 *sx, u64 *sy, u32 *np, int *pk) {
+static int blobs(int w, int h, int T, int mark, int nbl, u64 *sx, u64 *sy, u32 *np, int *pk, u32 *sat) {
   int cw = w>>4, ch = h>>4, nc = cw*ch;
   for (int q = 0; q < nc; q++) cells[q] = 0;
   const u64 add = 0x0101010101010101ull * (u64)(127 - (T-1 > 127 ? 127 : T-1));
@@ -309,7 +309,7 @@ static int blobs(int w, int h, int T, int mark, int nbl, u64 *sx, u64 *sy, u32 *
     if (!cells[q]) continue;
     int r = find(q), bi = -1;
     for (int e = b0; e < nbl; e++) if (roots[e] == r) { bi = e; break; }
-    if (bi < 0) { if (nbl == MAXB) continue; bi = nbl++; roots[bi] = r; sx[bi]=sy[bi]=0; np[bi]=0; pk[bi]=0; }
+    if (bi < 0) { if (nbl == MAXB) continue; bi = nbl++; roots[bi] = r; sx[bi]=sy[bi]=0; np[bi]=0; pk[bi]=0; sat[bi]=0; }
     int x0 = (q%cw)*16, y0 = (q/cw)*16;
     for (int y = y0; y < y0+16; y++) {
       const u8 *row = scratch + (size_t)y*w;
@@ -317,6 +317,7 @@ static int blobs(int w, int h, int T, int mark, int nbl, u64 *sx, u64 *sy, u32 *
         int v = row[x]; if (v > pk[bi]) pk[bi] = v;
         if (v < T) continue;
         sx[bi] += (u64)(x*10+5); sy[bi] += (u64)(y*10+5); np[bi]++;
+        if (v >= 250) sat[bi]++;
       }
     }
   }
@@ -354,17 +355,19 @@ static float goertzel(const float *x, int n, float f) {
 }
 
 /* long-frame sample rate from the recent long-frame timestamps (median gap);
- * 0 until enough are seen. This is the mains-mode-dependent rate: ~33.3 Hz
- * with the 50 Hz anti-flicker mode, ~30.0 Hz with 60 Hz. */
-static float longfps(struct cam *c) {
+ * 0 until enough are seen. *reliable = 0 when the gaps are wildly spread —
+ * frames are being dropped, and a spectrum over dropped-frame samples is
+ * garbage (bin frequencies alias unpredictably), so classification must wait. */
+static float longfps(struct cam *c, int *reliable) {
   double g[31]; int n = 0;
   for (int i = 1; i < c->nlfts && n < 31; i++) {
     double d = c->lfts[i] - c->lfts[i-1];
     if (d > 0.005 && d < 0.2) g[n++] = d;
   }
-  if (n < 8) return 0;
+  if (n < 8) { if (reliable) *reliable = 0; return 0; }
   for (int i = 1; i < n; i++) { double v = g[i]; int j = i-1; while (j >= 0 && g[j] > v) { g[j+1] = g[j]; j--; } g[j+1] = v; }
   double med = g[n/2];
+  if (reliable) *reliable = (g[n-1] - g[0]) < 0.35 * med;
   return (float)(1.0/med);
 }
 
@@ -378,21 +381,22 @@ static int spectral_test(const u8 *amp, int n, float fs, float fmin, float fstep
   for (int i = 0; i < n; i++) { mean += amp[i]; if (amp[i] >= PK_MIN) nz++; }
   mean /= n;
   for (int i = 0; i < n; i++) win[i] = (amp[i] - mean) * 0.5f * (1 - cosf(2.0f*(float)M_PI*i/(n-1)));
-  float floor_sum = 0; int best = -1; float bestm = 0;
-  for (int k = 0; k < nf; k++) {
+  float floor_sum = 0; int best = -1, nb = nf; float bestm = 0;
+  while (nb > 1 && (fmin + fstep*(nb-1)) > 0.45f*fs) nb--;   /* bins above Nyquist alias: drop them */
+  for (int k = skip_dc; k < nb; k++) {
     float m = goertzel(win, n, (fmin + fstep*k)/fs);   /* cycles per sample */
     floor_sum += m;
     if (m > bestm) { bestm = m; best = k; }
   }
   if (best < (skip_dc ? 1 : 0)) return 0;
-  float floormed = floor_sum/nf;
+  float floormed = floor_sum/nb;
   if (floormed < 1e-3f) return 0;
   float q = bestm/floormed;
   float f0 = fmin + fstep*best;
   /* stability: peak frequency of the first vs second half of the window */
   int h = n/2;
   float b1 = 0, b2 = 0; int k1 = -1, k2 = -1;
-  for (int k = skip_dc; k < nf; k++) {
+  for (int k = skip_dc; k < nb; k++) {
     float f = (fmin + fstep*k)/fs;
     float m1 = goertzel(win, h, f);
     float m2 = goertzel(win+h, n-h, f);
@@ -412,7 +416,7 @@ static int spectral_test(const u8 *amp, int n, float fs, float fmin, float fstep
  * halve the measured rate (15 Hz) — that is NOT a mode switch, so only rates
  * that look like a real mode, confirmed on consecutive checks, flush. */
 static void check_rate(struct cam *c) {
-  float fs = longfps(c);
+  float fs = longfps(c, 0);
   if (fs <= 0) return;
   int plausible = (fs > 28.5f && fs < 31.5f) || (fs > 32.3f && fs < 34.3f);
   int changed = c->last_fs && fabsf(fs - c->last_fs) > 1.5f;
@@ -435,8 +439,9 @@ static void check_rate(struct cam *c) {
 
 static void analyse(struct cam *c, struct track *tr) {
   if (tr->n < DFT_MIN || tr->hits < MIN_HITS) return;
-  float fs = longfps(c);
-  if (fs < 15.0f || fs > 60.0f) return;
+  int reliable = 0;
+  float fs = longfps(c, &reliable);
+  if (fs < 25.0f || fs > 36.0f || !reliable) return;   /* 30.0 / 33.33 Hz modes only, clean timing */
   if (!c->nlfts_reported) {
     c->nlfts_reported = 1;
     out("I cam%d long frames every %.2f ms (%.2f Hz sample rate)", (int)(c-C), 1000.0f/fs, fs);
@@ -630,36 +635,37 @@ static void frame(int k, int i, const struct v4l2_buffer *b) {
     return;
   }
   u64 t0 = now_ns();
-  u64 sx[MAXB], sy[MAXB]; u32 np[MAXB]; int pk[MAXB];
+  u64 sx[MAXB], sy[MAXB]; u32 np[MAXB]; int pk[MAXB]; u32 sat[MAXB];
   int T = mean*4/10; if (T < 64) T = 64;
   int nc = (c->w>>4)*(c->h>>4);
   memset(hot, 0, (size_t)nc);
-  int nbl = blobs(c->w, c->h, 250, 1, 0, sx, sy, np, pk);
-  if (T < 250) nbl = blobs(c->w, c->h, T, 0, nbl, sx, sy, np, pk);
+  int nbl = blobs(c->w, c->h, 250, 1, 0, sx, sy, np, pk, sat);
+  if (T < 250) nbl = blobs(c->w, c->h, T, 0, nbl, sx, sy, np, pk, sat);
   scan_ns += now_ns() - t0; nscan++;
   double tn = t_us/1e6;
   if (c->nlfts < 32) c->lfts[c->nlfts++] = tn;
   else { memmove(c->lfts, c->lfts+1, 31*sizeof *c->lfts); c->lfts[31] = tn; }
   check_rate(c);
   track_update(c, tn, sx, sy, np, pk, nbl);
-  /* Emit only classified tracks: the lighthouse is by far the brightest thing
-   * in view, and a track that holds a small saturated dot through a stable
-   * rotor-beat while the head is steady IS a base station — rig illuminators
-   * are strobe-locked (constant), lamps are common-mode, scene specks have no
-   * beat. Everything else stays off the wire. */
+  /* Brightness/intensity gate, then raw emission: the aperture saturates a
+   * SOLID core of pixels, while laser spatter on walls is dimmer and sparser
+   * and shares the rotor modulation (so beat tests can't reject it). Keep
+   * saturated compact cores, brightest first; the PC's geometric gates do the
+   * rest. The beat classifier stays up as B diagnostics only. */
+  int cand[MAXB], nc2 = 0;
+  for (int e = 0; e < nbl; e++) {
+    if (pk[e] < 250 || (int)np[e] > 150 || sat[e] < 4) continue;
+    cand[nc2++] = e;
+  }
+  for (int a = 1; a < nc2; a++) {
+    int v = cand[a], b2 = a-1;
+    while (b2 >= 0 && sat[cand[b2]] < sat[v]) { cand[b2+1] = cand[b2]; b2--; }
+    cand[b2+1] = v;
+  }
   char bl[1800] = {0}; int L2 = 0, n = 0;
-  for (int i2 = 0; i2 < MAXTRACKS; i2++) {
-    struct track *tr = &c->tr[i2];
-    if (!tr->used || tr->state != T_ACTIVE) continue;
-    for (int e = 0; e < nbl; e++) {
-      float bx = sx[e]/10.0f, by = sy[e]/10.0f;
-      float dx = tr->x-bx, dy = tr->y-by;
-      if (dx*dx+dy*dy > RADIUS2) continue;
-      L2 += snprintf(bl+L2, sizeof bl-L2, " %lld %lld %u %d", (long long)sx[e]/np[e], (long long)sy[e]/np[e], np[e], pk[e]);
-      n++;
-      break;
-    }
-    if (L2 > (int)sizeof bl - 64) break;
+  for (int e = 0; e < nc2 && n < 16; e++) {
+    L2 += snprintf(bl+L2, sizeof bl-L2, " %lld %lld %u %d", (long long)sx[cand[e]]/np[cand[e]], (long long)sy[cand[e]]/np[cand[e]], np[cand[e]], pk[cand[e]]);
+    n++;
   }
   out("F %d %u %llu %d %d%s", k, b->sequence, (unsigned long long)t_us, mean, n, bl);
 }
