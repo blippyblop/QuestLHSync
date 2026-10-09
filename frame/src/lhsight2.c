@@ -95,6 +95,7 @@ struct track {
   u8 amp[DFT_WIN];         /* amplitude ring (peak, 0 = absent) */
   u8 npx[DFT_WIN];
   float f0; float q; float pres;   /* last analysis */
+  float npema;                     /* mean solid size when present: the brightness rank */
   int tick;                        /* analysis pacing once the ring is full */
   double since_classified;
 };
@@ -647,25 +648,42 @@ static void frame(int k, int i, const struct v4l2_buffer *b) {
   else { memmove(c->lfts, c->lfts+1, 31*sizeof *c->lfts); c->lfts[31] = tn; }
   check_rate(c);
   track_update(c, tn, sx, sy, np, pk, nbl);
-  /* Brightness/intensity gate, then raw emission: the aperture saturates a
-   * SOLID core of pixels, while laser spatter on walls is dimmer and sparser
-   * and shares the rotor modulation (so beat tests can't reject it). Keep
-   * saturated compact cores, brightest first; the PC's geometric gates do the
-   * rest. The beat classifier stays up as B diagnostics only. */
-  int cand[MAXB], nc2 = 0;
-  for (int e = 0; e < nbl; e++) {
-    if (pk[e] < 250 || (int)np[e] > 150 || sat[e] < 4) continue;
-    cand[nc2++] = e;
+  /* 1. FIND ALL DOTS WITH THE LIGHTHOUSE PATTERN: ACTIVE tracks — small,
+   *    saturated, and holding a stable rotor-beat on a clean frame grid.
+   *    Wall spatter shares the modulation, so it passes this stage too.
+   * 2. PICK THE BRIGHTEST ONES: rank pattern-matching tracks by their mean
+   *    solid core (npx where present) — the aperture is far brighter than
+   *    its own spatter, lamps have no pattern, and scene specks have neither.
+   *    Top 3 per camera go out; the PC's geometric gates classify. */
+  struct rk { struct track *tr; float sc; } rk[MAXTRACKS];
+  int nr = 0;
+  for (int i2 = 0; i2 < MAXTRACKS; i2++) {
+    struct track *tr = &c->tr[i2];
+    if (!tr->used || tr->state != T_ACTIVE) continue;
+    float sum = 0; int cnt = 0;
+    for (int i = 0; i < tr->n; i++)
+      if (tr->amp[i] >= PK_MIN) { sum += tr->npx[i]; cnt++; }
+    if (!cnt) continue;
+    rk[nr].tr = tr; rk[nr].sc = sum/cnt; nr++;
   }
-  for (int a = 1; a < nc2; a++) {
-    int v = cand[a], b2 = a-1;
-    while (b2 >= 0 && sat[cand[b2]] < sat[v]) { cand[b2+1] = cand[b2]; b2--; }
-    cand[b2+1] = v;
+  for (int a = 1; a < nr; a++) {
+    struct rk v = rk[a]; int b2 = a-1;
+    while (b2 >= 0 && rk[b2].sc < v.sc) { rk[b2+1] = rk[b2]; b2--; }
+    rk[b2+1] = v;
   }
+  if (nr > 3) nr = 3;
   char bl[1800] = {0}; int L2 = 0, n = 0;
-  for (int e = 0; e < nc2 && n < 16; e++) {
-    L2 += snprintf(bl+L2, sizeof bl-L2, " %lld %lld %u %d", (long long)sx[cand[e]]/np[cand[e]], (long long)sy[cand[e]]/np[cand[e]], np[cand[e]], pk[cand[e]]);
-    n++;
+  for (int r2 = 0; r2 < nr; r2++) {
+    struct track *tr = rk[r2].tr;
+    for (int e = 0; e < nbl; e++) {
+      float bx = sx[e]/10.0f, by = sy[e]/10.0f;
+      float dx = tr->x-bx, dy = tr->y-by;
+      if (dx*dx+dy*dy > RADIUS2) continue;
+      L2 += snprintf(bl+L2, sizeof bl-L2, " %lld %lld %u %d", (long long)sx[e]/np[e], (long long)sy[e]/np[e], np[e], pk[e]);
+      n++;
+      break;
+    }
+    if (L2 > (int)sizeof bl - 64) break;
   }
   out("F %d %u %llu %d %d%s", k, b->sequence, (unsigned long long)t_us, mean, n, bl);
 }
