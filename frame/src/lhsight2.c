@@ -63,7 +63,7 @@
 #define MAXTRACKS   8      /* per camera (4 stations max + margin) */
 #define DFT_WIN     768    /* amplitude ring: long frames (~23 s at 30 Hz) */
 #define FAST_WIN    384    /* fast-beat window (~11.5 s): 60 Hz-mode beats */
-#define DFT_MIN     160    /* minimum samples before classifying (~5.3 s) */
+#define DFT_MIN     96     /* minimum samples before classifying (~3.2 s) */
 #define LONG_MIN    640    /* minimum samples for the slow-beat window (~21 s) */
 #define DFT_STEP    64     /* re-analyse every N long frames */
 #define NFREQ       48     /* fast window: 0.5 .. 24.0 Hz in 0.5 Hz steps */
@@ -528,6 +528,61 @@ static int torn(struct cam *c, int i, const struct v4l2_buffer *b) {
   ntorn++;
   return 1;
 }
+/* motion gate: a coarse still/panning test from cam0's long frames. The dots
+ * worth sending come from steady head poses — while panning, every dot's ray
+ * is bent by the pose-timing error (12.9 ms +- 3.8 on this link: 30 deg/s of
+ * turn bends a 3 m ray ~1.5 cm), and the bend is coherent, so the PC's
+ * scatter gates can't see it. Hold dots back while panning. */
+#define MDS       2      /* motion downsample: 1 ds px = 2 full-res px */
+#define MR_RANGE  8      /* search +-8 ds px (about +-48 deg/s between frames) */
+#define MR_STEP   2
+#define MOTION_GATE 2    /* ds px of clear shift that counts as panning (~21 deg/s) */
+static u8 mcur[2048*2048/(MDS*MDS)], mprev[2048*2048/(MDS*MDS)];
+static int mhave, mpan_run, mstill_run, g_panning;
+
+static int motion_est(int w, int h) {
+  int dw = w/MDS, dh = h/MDS;
+  if (dw > 2048/MDS || dh > 2048/MDS) return g_panning;
+  for (int y = 0; y < dh; y++)
+    for (int x = 0; x < dw; x++)
+      mcur[y*dw+x] = scratch[((size_t)(y*MDS)+(MDS/2))*w + x*MDS];
+  if (!mhave) { memcpy(mprev, mcur, (size_t)dw*dh); mhave = 1; return g_panning; }
+  int s00 = 0;
+  for (int y = 2; y < dh-2; y += 2)
+    for (int x = 2; x < dw-2; x += 2)
+      s00 += abs(mcur[y*dw+x] - mprev[y*dw+x]);
+  int best = 1<<30, bx = 0, by = 0;
+  for (int dy = -MR_RANGE; dy <= MR_RANGE; dy += MR_STEP)
+    for (int dx = -MR_RANGE; dx <= MR_RANGE; dx += MR_STEP) {
+      if (!dx && !dy) continue;
+      int sum = 0;
+      for (int y = 2; y < dh-2; y += 2)
+        for (int x = 2; x < dw-2; x += 2) {
+          int yy = y+dy, xx = x+dx;
+          if ((unsigned)yy >= (unsigned)(dh-4) || (unsigned)xx >= (unsigned)(dw-4)) continue;
+          sum += abs(mcur[y*dw+x] - mprev[yy*dw+xx]);
+        }
+      if (sum < best) { best = sum; bx = dx; by = dy; }
+    }
+  memcpy(mprev, mcur, (size_t)dw*dh);
+  int n = ((dh-4)/2)*((dw-4)/2);
+  if (n <= 0) return g_panning;
+  float sad0 = (float)s00/n, sadm = (float)best/n;
+  /* no clear shift, or a featureless frame: treat as still (the PC's fast
+   * gate backstops); a clear minimum away from 0 is panning */
+  int panning;
+  if (sadm >= 0.95f*sad0 || sad0 < 2.0f) panning = 0;
+  else panning = (abs(bx) >= MOTION_GATE || abs(by) >= MOTION_GATE);
+  if (panning) {
+    mpan_run++; mstill_run = 0;
+    if (mpan_run >= 2 && !g_panning) { g_panning = 1; out("I motion: panning, dots held back"); }
+  } else {
+    mstill_run++; mpan_run = 0;
+    if (mstill_run >= 2 && g_panning) { g_panning = 0; out("I motion: steady, dots resumed"); }
+  }
+  return g_panning;
+}
+
 static void frame(int k, int i, const struct v4l2_buffer *b) {
   struct cam *c = &C[k];
   double ts = b->timestamp.tv_sec + b->timestamp.tv_usec/1e6;
@@ -567,6 +622,13 @@ static void frame(int k, int i, const struct v4l2_buffer *b) {
     return;
   }
   c->longs++;
+  if (k == 0) motion_est(c->w, c->h);
+  check_rate(c);
+  if (g_panning) {
+    /* hold dots back while the head pans: cadence only */
+    out("F %d %u %llu %d -1", k, b->sequence, (unsigned long long)t_us, mean);
+    return;
+  }
   u64 t0 = now_ns();
   u64 sx[MAXB], sy[MAXB]; u32 np[MAXB]; int pk[MAXB];
   int T = mean*4/10; if (T < 64) T = 64;
@@ -580,17 +642,24 @@ static void frame(int k, int i, const struct v4l2_buffer *b) {
   else { memmove(c->lfts, c->lfts+1, 31*sizeof *c->lfts); c->lfts[31] = tn; }
   check_rate(c);
   track_update(c, tn, sx, sy, np, pk, nbl);
-  /* Emit every plausible lighthouse-sized blob, unclassified: the PC pairs
-   * each dot with the SLAM pose at exposure time and its station gates do the
-   * real classification — pixel-space tracks can't survive head motion (24 px
-   * is ~2 frames of a 60 deg/s turn), and gating emission on a 5 s beat fit
-   * meant nothing moved while worn. The beat analysis stays up purely as B
-   * diagnostics. */
+  /* Emit only classified tracks: the lighthouse is by far the brightest thing
+   * in view, and a track that holds a small saturated dot through a stable
+   * rotor-beat while the head is steady IS a base station — rig illuminators
+   * are strobe-locked (constant), lamps are common-mode, scene specks have no
+   * beat. Everything else stays off the wire. */
   char bl[1800] = {0}; int L2 = 0, n = 0;
-  for (int e = 0; e < nbl && n < 24; e++) {
-    if (pk[e] < 200 || (int)np[e] > 150 || !np[e]) continue;
-    L2 += snprintf(bl+L2, sizeof bl-L2, " %lld %lld %u %d", (long long)sx[e]/np[e], (long long)sy[e]/np[e], np[e], pk[e]);
-    n++;
+  for (int i2 = 0; i2 < MAXTRACKS; i2++) {
+    struct track *tr = &c->tr[i2];
+    if (!tr->used || tr->state != T_ACTIVE) continue;
+    for (int e = 0; e < nbl; e++) {
+      float bx = sx[e]/10.0f, by = sy[e]/10.0f;
+      float dx = tr->x-bx, dy = tr->y-by;
+      if (dx*dx+dy*dy > RADIUS2) continue;
+      L2 += snprintf(bl+L2, sizeof bl-L2, " %lld %lld %u %d", (long long)sx[e]/np[e], (long long)sy[e]/np[e], np[e], pk[e]);
+      n++;
+      break;
+    }
+    if (L2 > (int)sizeof bl - 64) break;
   }
   out("F %d %u %llu %d %d%s", k, b->sequence, (unsigned long long)t_us, mean, n, bl);
 }
