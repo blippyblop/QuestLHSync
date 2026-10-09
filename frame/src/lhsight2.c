@@ -64,6 +64,10 @@
 #define DFT_WIN     768    /* amplitude ring: long frames (~23 s at 30 Hz) */
 #define FAST_WIN    384    /* fast-beat window (~11.5 s): 60 Hz-mode beats */
 #define DFT_MIN     96     /* minimum samples before classifying (~3.2 s) */
+#define MOD_WIN     24     /* confirmation window: long frames (~0.8 s) */
+#define MOD_PRESENT 6      /* min present samples in the window */
+#define MOD_SWING   64     /* min peak swing over the window */
+#define LATCH_MISS  1.5    /* s: confirmed track survives this long without a dot */
 #define LONG_MIN    640    /* minimum samples for the slow-beat window (~21 s) */
 #define DFT_STEP    64     /* re-analyse every N long frames */
 #define NFREQ       48     /* fast window: 0.5 .. 24.0 Hz in 0.5 Hz steps */
@@ -98,6 +102,7 @@ struct track {
   float npema;                     /* mean solid size when present: the brightness rank */
   int tick;                        /* analysis pacing once the ring is full */
   int emitted;                     /* dots sent for this track (diagnostic log gate) */
+  int confirmed;                   /* modulation confirmed over MOD_WIN samples */
   double since_classified;
 };
 
@@ -482,6 +487,33 @@ static void analyse(struct cam *c, struct track *tr) {
   out("B %d %d %.1f %.1f %.2f %.1f %.2f %d %d %.2f %s", (int)(c-C), tr->id, tr->x, tr->y, f0, q ? q : qfail, pres, tr->hits, tr->state, fs, how);
 }
 
+/* confirmation: over the last MOD_WIN samples the dot was present often
+ * enough and its brightness visibly swung (dropouts count -- the aperture is
+ * saturated, so the beat lives in the zeros). Once confirmed, the dot is
+ * emitted continuously with a LATCH_MISS grace, instead of re-qualifying
+ * every frame. */
+static int check_confirm(struct track *tr) {
+  int n = tr->n, lo = tr->n;
+  if (n > MOD_WIN) lo = n - MOD_WIN;
+  int present = 0, mx = 0, mn = 256;
+  for (int i = lo; i < n; i++) {
+    if (tr->amp[i] > mx) mx = tr->amp[i];
+    if (tr->amp[i] < mn) mn = tr->amp[i];
+    if (tr->amp[i] >= PK_MIN) present++;
+  }
+  return present >= MOD_PRESENT && mx - mn >= MOD_SWING;
+}
+
+static double last_confirmlog;
+static void track_confirm(struct cam *c, struct track *tr) {
+  if (tr->confirmed || !check_confirm(tr)) return;
+  tr->confirmed = 1;
+  if (now_s(CLOCK_MONOTONIC) - last_confirmlog > 1.0) {
+    last_confirmlog = now_s(CLOCK_MONOTONIC);
+    out("I cam%d track %d confirmed modulated (%.1f,%.1f)", (int)(c-C), tr->id, tr->x, tr->y);
+  }
+}
+
 static void track_update(struct cam *c, double t, const u64 *sx, const u64 *sy, const u32 *np, const int *pk, int nbl) {
   struct track *tr;
   u8 taken[MAXTRACKS] = {0};
@@ -514,6 +546,7 @@ static void track_update(struct cam *c, double t, const u64 *sx, const u64 *sy, 
     /* push amplitude sample (one per long frame) */
     if (best->n < DFT_WIN) { best->amp[best->n] = (u8)(pkv > 255 ? 255 : pkv); best->npx[best->n] = (u8)(npx > 255 ? 255 : npx); best->n++; }
     else { memmove(best->amp, best->amp+1, DFT_WIN-1); memmove(best->npx, best->npx+1, DFT_WIN-1); best->amp[DFT_WIN-1] = (u8)pkv; best->npx[DFT_WIN-1] = (u8)(npx>255?255:npx); }
+    track_confirm(c, best);
     if (best->n == DFT_MIN || (best->n % DFT_STEP == 0 && best->n < DFT_WIN) ||
         (best->n == DFT_WIN && (++best->tick & 15) == 0)) analyse(c, best);
   }
@@ -521,6 +554,7 @@ static void track_update(struct cam *c, double t, const u64 *sx, const u64 *sy, 
   for (int i = 0; i < MAXTRACKS; i++) {
     tr = &c->tr[i];
     if (!tr->used || taken[i]) continue;
+    if (tr->confirmed && t - tr->last_hit > LATCH_MISS) tr->confirmed = 0;
     if (tr->n < DFT_WIN) { tr->amp[tr->n] = 0; tr->npx[tr->n] = 0; tr->n++; }
     else { memmove(tr->amp, tr->amp+1, DFT_WIN-1); memmove(tr->npx, tr->npx+1, DFT_WIN-1); tr->amp[DFT_WIN-1] = 0; tr->npx[DFT_WIN-1] = 0; }
     if (tr->n == DFT_MIN || (tr->n % DFT_STEP == 0 && tr->n < DFT_WIN) ||
@@ -540,17 +574,22 @@ static int torn(struct cam *c, int i, const struct v4l2_buffer *b) {
  * the rotor sweeps; spatter pulses too (it passes — brightness ranks it);
  * static lamps, rig glow and scene specks don't swing at all. Works worn:
  * it needs only a handful of samples and no frame-grid assumptions. */
+/* 1. is this dot MODULATED? The aperture saturates, so its amplitude is
+ * pegged at 255 -- the rotor beat survives as the DROPOUT pattern instead:
+ * frames where the sweeps missed the exposure window sample as 0. So the
+ * swing is measured over ALL samples, zeros included: a dot that blinks or
+ * swings passes; a dot at constant brightness (lamps, rig glow, a saturated
+ * static highlight) does not. */
 static int track_modulated(const struct track *tr) {
   int n = tr->n, lo = tr->n;
   if (n > 16) lo = n-16;
   int present = 0, mx = 0, mn = 256;
   for (int i = lo; i < n; i++) {
-    if (tr->amp[i] < PK_MIN) continue;
-    present++;
     if (tr->amp[i] > mx) mx = tr->amp[i];
     if (tr->amp[i] < mn) mn = tr->amp[i];
+    if (tr->amp[i] >= PK_MIN) present++;
   }
-  return present >= 2 && mx - mn >= 48;
+  return present >= 2 && n-lo >= 4 && mx - mn >= 64;
 }
 
 static void frame(int k, int i, const struct v4l2_buffer *b) {
@@ -606,29 +645,39 @@ static void frame(int k, int i, const struct v4l2_buffer *b) {
   else { memmove(c->lfts, c->lfts+1, 31*sizeof *c->lfts); c->lfts[31] = tn; }
   check_rate(c);
   track_update(c, tn, sx, sy, np, pk, nbl);
-  /* DIAGNOSTIC MODE: brightness ranking off. Every modulated track's dot
-   * goes out, brightest or not, so we can see whether modulation alone
-   * finds the stations. Each track's first emission is logged. */
-  static double last_modlog;
-  char bl[1800] = {0}; int L2 = 0, n = 0;
+  /* Confirmed-modulated tracks only, brightest first (mean solid core),
+   * top 3 per camera: the aperture outranks its own wall spatter by a wide
+   * margin, lamps never confirm (no swing), and the latch keeps a confirmed
+   * dot flowing through brief association gaps. */
+  struct rk { struct track *tr; float sc; } rk[MAXTRACKS];
+  int nr = 0;
   for (int i2 = 0; i2 < MAXTRACKS; i2++) {
     struct track *tr = &c->tr[i2];
-    if (!tr->used || !track_modulated(tr)) continue;
+    if (!tr->used || !tr->confirmed) continue;
+    float sum = 0; int cnt = 0;
+    for (int i = 0; i < tr->n; i++)
+      if (tr->amp[i] >= PK_MIN) { sum += tr->npx[i]; cnt++; }
+    if (!cnt) continue;
+    rk[nr].tr = tr; rk[nr].sc = sum/cnt; nr++;
+  }
+  for (int a = 1; a < nr; a++) {
+    struct rk v = rk[a]; int b2 = a-1;
+    while (b2 >= 0 && rk[b2].sc < v.sc) { rk[b2+1] = rk[b2]; b2--; }
+    rk[b2+1] = v;
+  }
+  if (nr > 3) nr = 3;
+  char bl[1800] = {0}; int L2 = 0, n = 0;
+  for (int r2 = 0; r2 < nr; r2++) {
+    struct track *tr = rk[r2].tr;
     for (int e = 0; e < nbl; e++) {
       float bx = sx[e]/10.0f, by = sy[e]/10.0f;
       float dx = tr->x-bx, dy = tr->y-by;
       if (dx*dx+dy*dy > RADIUS2) continue;
-      if (L2 < (int)sizeof bl - 96) {
-        L2 += snprintf(bl+L2, sizeof bl-L2, " %lld %lld %u %d", (long long)sx[e]/np[e], (long long)sy[e]/np[e], np[e], pk[e]);
-        n++;
-      }
-      if (tr->emitted++ == 0 && now_s(CLOCK_MONOTONIC) - last_modlog > 1.0) {
-        last_modlog = now_s(CLOCK_MONOTONIC);
-        out("I cam%d track %d modulated: hits %d, emitting at (%.1f,%.1f)", (int)(c-C), tr->id, tr->hits, tr->x, tr->y);
-      }
+      L2 += snprintf(bl+L2, sizeof bl-L2, " %lld %lld %u %d", (long long)sx[e]/np[e], (long long)sy[e]/np[e], np[e], pk[e]);
+      n++;
       break;
     }
-    if (L2 > (int)sizeof bl - 96) break;
+    if (L2 > (int)sizeof bl - 64) break;
   }
   out("F %d %u %llu %d %d%s", k, b->sequence, (unsigned long long)t_us, mean, n, bl);
 }
