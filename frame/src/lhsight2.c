@@ -534,61 +534,6 @@ static int torn(struct cam *c, int i, const struct v4l2_buffer *b) {
   ntorn++;
   return 1;
 }
-/* motion gate: a coarse still/panning test from cam0's long frames. The dots
- * worth sending come from steady head poses — while panning, every dot's ray
- * is bent by the pose-timing error (12.9 ms +- 3.8 on this link: 30 deg/s of
- * turn bends a 3 m ray ~1.5 cm), and the bend is coherent, so the PC's
- * scatter gates can't see it. Hold dots back while panning. */
-#define MDS       2      /* motion downsample: 1 ds px = 2 full-res px */
-#define MR_RANGE  8      /* search +-8 ds px (about +-48 deg/s between frames) */
-#define MR_STEP   2
-#define MOTION_GATE 2    /* ds px of clear shift that counts as panning (~21 deg/s) */
-static u8 mcur[2048*2048/(MDS*MDS)], mprev[2048*2048/(MDS*MDS)];
-static int mhave, mpan_run, mstill_run, g_panning;
-
-static int motion_est(int w, int h) {
-  int dw = w/MDS, dh = h/MDS;
-  if (dw > 2048/MDS || dh > 2048/MDS) return g_panning;
-  for (int y = 0; y < dh; y++)
-    for (int x = 0; x < dw; x++)
-      mcur[y*dw+x] = scratch[((size_t)(y*MDS)+(MDS/2))*w + x*MDS];
-  if (!mhave) { memcpy(mprev, mcur, (size_t)dw*dh); mhave = 1; return g_panning; }
-  int s00 = 0;
-  for (int y = 2; y < dh-2; y += 2)
-    for (int x = 2; x < dw-2; x += 2)
-      s00 += abs(mcur[y*dw+x] - mprev[y*dw+x]);
-  int best = 1<<30, bx = 0, by = 0;
-  for (int dy = -MR_RANGE; dy <= MR_RANGE; dy += MR_STEP)
-    for (int dx = -MR_RANGE; dx <= MR_RANGE; dx += MR_STEP) {
-      if (!dx && !dy) continue;
-      int sum = 0;
-      for (int y = 2; y < dh-2; y += 2)
-        for (int x = 2; x < dw-2; x += 2) {
-          int yy = y+dy, xx = x+dx;
-          if ((unsigned)yy >= (unsigned)(dh-4) || (unsigned)xx >= (unsigned)(dw-4)) continue;
-          sum += abs(mcur[y*dw+x] - mprev[yy*dw+xx]);
-        }
-      if (sum < best) { best = sum; bx = dx; by = dy; }
-    }
-  memcpy(mprev, mcur, (size_t)dw*dh);
-  int n = ((dh-4)/2)*((dw-4)/2);
-  if (n <= 0) return g_panning;
-  float sad0 = (float)s00/n, sadm = (float)best/n;
-  /* no clear shift, or a featureless frame: treat as still (the PC's fast
-   * gate backstops); a clear minimum away from 0 is panning */
-  int panning;
-  if (sadm >= 0.95f*sad0 || sad0 < 2.0f) panning = 0;
-  else panning = (abs(bx) >= MOTION_GATE || abs(by) >= MOTION_GATE);
-  if (panning) {
-    mpan_run++; mstill_run = 0;
-    if (mpan_run >= 2 && !g_panning) { g_panning = 1; out("I motion: panning, dots held back"); }
-  } else {
-    mstill_run++; mpan_run = 0;
-    if (mstill_run >= 2 && g_panning) { g_panning = 0; out("I motion: steady, dots resumed"); }
-  }
-  return g_panning;
-}
-
 static void frame(int k, int i, const struct v4l2_buffer *b) {
   struct cam *c = &C[k];
   double ts = b->timestamp.tv_sec + b->timestamp.tv_usec/1e6;
@@ -628,13 +573,7 @@ static void frame(int k, int i, const struct v4l2_buffer *b) {
     return;
   }
   c->longs++;
-  if (k == 0) motion_est(c->w, c->h);
   check_rate(c);
-  if (g_panning) {
-    /* hold dots back while the head pans: cadence only */
-    out("F %d %u %llu %d -1", k, b->sequence, (unsigned long long)t_us, mean);
-    return;
-  }
   u64 t0 = now_ns();
   u64 sx[MAXB], sy[MAXB]; u32 np[MAXB]; int pk[MAXB]; u32 sat[MAXB];
   int T = mean*4/10; if (T < 64) T = 64;
@@ -648,44 +587,26 @@ static void frame(int k, int i, const struct v4l2_buffer *b) {
   else { memmove(c->lfts, c->lfts+1, 31*sizeof *c->lfts); c->lfts[31] = tn; }
   check_rate(c);
   track_update(c, tn, sx, sy, np, pk, nbl);
-  /* 1. FIND ALL DOTS WITH THE LIGHTHOUSE PATTERN: ACTIVE tracks — small,
-   *    saturated, and holding a stable rotor-beat on a clean frame grid.
-   *    Wall spatter shares the modulation, so it passes this stage too.
-   * 2. PICK THE BRIGHTEST ONES: rank pattern-matching tracks by their mean
-   *    solid core (npx where present) — the aperture is far brighter than
-   *    its own spatter, lamps have no pattern, and scene specks have neither.
-   *    Top 3 per camera go out; the PC's geometric gates classify. */
-  struct rk { struct track *tr; float sc; } rk[MAXTRACKS];
-  int nr = 0;
-  for (int i2 = 0; i2 < MAXTRACKS; i2++) {
-    struct track *tr = &c->tr[i2];
-    if (!tr->used || tr->state != T_ACTIVE) continue;
-    float sum = 0; int cnt = 0;
-    for (int i = 0; i < tr->n; i++)
-      if (tr->amp[i] >= PK_MIN) { sum += tr->npx[i]; cnt++; }
-    if (!cnt) continue;
-    rk[nr].tr = tr; rk[nr].sc = sum/cnt; nr++;
+  /* Brightness/intensity gate, then raw emission: the aperture saturates a
+   * SOLID core of pixels (>= 4 px at 250+), while laser spatter on walls is
+   * dimmer and sparser and lamp blooms are huge. Brightest cores first; the
+   * PC's geometric gates classify. The beat analysis runs as B diagnostics. */
+  int cand[MAXB], nc2 = 0;
+  for (int e = 0; e < nbl; e++) {
+    if (pk[e] < 250 || (int)np[e] > 150 || sat[e] < 4) continue;
+    cand[nc2++] = e;
   }
-  for (int a = 1; a < nr; a++) {
-    struct rk v = rk[a]; int b2 = a-1;
-    while (b2 >= 0 && rk[b2].sc < v.sc) { rk[b2+1] = rk[b2]; b2--; }
-    rk[b2+1] = v;
+  for (int a = 1; a < nc2; a++) {
+    int v = cand[a], b2 = a-1;
+    while (b2 >= 0 && sat[cand[b2]] < sat[v]) { cand[b2+1] = cand[b2]; b2--; }
+    cand[b2+1] = v;
   }
-  if (nr > 3) nr = 3;
   char bl[1800] = {0}; int L2 = 0, n = 0;
-  for (int r2 = 0; r2 < nr; r2++) {
-    struct track *tr = rk[r2].tr;
-    for (int e = 0; e < nbl; e++) {
-      float bx = sx[e]/10.0f, by = sy[e]/10.0f;
-      float dx = tr->x-bx, dy = tr->y-by;
-      if (dx*dx+dy*dy > RADIUS2) continue;
-      L2 += snprintf(bl+L2, sizeof bl-L2, " %lld %lld %u %d", (long long)sx[e]/np[e], (long long)sy[e]/np[e], np[e], pk[e]);
-      n++;
-      break;
-    }
-    if (L2 > (int)sizeof bl - 64) break;
+  for (int e = 0; e < nc2 && n < 16; e++) {
+    L2 += snprintf(bl+L2, sizeof bl-L2, " %lld %lld %u %d", (long long)sx[cand[e]]/np[cand[e]], (long long)sy[cand[e]]/np[cand[e]], np[cand[e]], pk[cand[e]]);
+    n++;
   }
-  out("F %d %u %llu %d %d%s", k, b->sequence, (unsigned long long)t_us, mean, n, bl);
+out("F %d %u %llu %d %d%s", k, b->sequence, (unsigned long long)t_us, mean, n, bl);
 }
 static void poll_camera(int k) {
   struct cam *c = &C[k];
