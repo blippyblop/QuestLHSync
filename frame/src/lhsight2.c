@@ -1,31 +1,32 @@
-/* lhsight2 (Steam Frame): lighthouse-blob detector, rebuild v1.
+/* lhsight2 (Steam Frame): lighthouse-blob detector, RAW DUAL-CLASS SENSOR.
  *
- * Replaces lhsight's "saturated blobs on short frames" with a temporal
- * classifier tuned for the Frame's SLAM cameras:
+ * The frame is a sensor, not a classifier: it scans EVERY frame of both
+ * exposure classes and reports every blob it finds, unfiltered. All gating
+ * and classification lives PC-side (src/driver/sync.cpp: direction cells +
+ * short-frame presence). Rationale and measured margins live there too.
  *
- *   - LONG frames are scanned (short frames are the empty ones in a dark
- *     room; stock lhsight scanned only shorts and starved). Short frames are
- *     still reported as "F cam seq t_us mean -1" so the PC's frame-grid
- *     learning keeps its regular cadence.
- *   - Blobs are tracked across frames per camera (nearest within RADIUS px).
- *   - Each track's amplitude (blob peak, 0 when absent) is sampled once per
- *     long frame (~33.3 Hz). A track is CLASSIFIED when its amplitude spectrum
- *     over the last DFT_WIN long frames has a single stable dominant peak:
- *       presence >= PRES_MIN, size <= MAXNPX.
- *     - Rotor phase drifts against the frame grid, so a real base station's
- *       dot AM-modulates (measured: ~9.8 Hz, 73% presence). The rig's own IR
- *       illuminators are strobe-locked to long frames: constant amplitude,
- *       no peak -> rejected. Mains lamps are common-mode; the per-track mean
- *       is subtracted and huge blobs never enter tracks.
- *   - Only CLASSIFIED tracks' blobs go out on the wire, in the stock
- *     4-tuple format ("F cam seq t_us mean nb x y npx peak ..."), so the PC
- *     driver works unchanged. Diagnostics go on "B" lines (ignored by the PC).
+ *   - Frame class: a frame is SHORT when much darker than the running max of
+ *     the recent frames (mean*10 < rmax*6; rmax decays ~3%/frame so missed
+ *     frames don't break the split), else LONG. Long SLAM frames and short
+ *     controller-LED frames alternate per camera (~30 fps each class).
+ *   - Blob detection per frame, two passes: saturated (threshold 250), then
+ *     dim (max(4*mean, 64)) only in 16x16 cells the saturated pass didn't
+ *     mark hot (so a lamp's glow doesn't merge into the dim pass).
+ *   - Emission: every blob of every frame goes out on the wire. Nothing is
+ *     dropped, merged or classified here.
  *
  * Lines:
- *   F cam seq t_us mean*10 nb [x y npx peak]...   nb=-1 on short frames
- *   B cam id x y f_hz q pres hits state           once a second per track
- *   T t_us frames scans scan_us torn polls        once a second
+ *   F cam seq t_us mean*10 nb [x y npx peak]... C   one per frame, every frame
+ *       x, y are pixel*10 centroids; C is the frame class 'L' or 'S' (the
+ *       trailing token; stock lhsight never emits it, and the PC reads
+ *       untagged lines with stock Quest semantics)
+ *   T t_us frames N scans N scan_us U torn N polls N  once a second
  *   I/W/E messages
+ *
+ * The track/beat machinery further down (struct track, track_update,
+ * analyse, check_confirm, track_modulated) is DEAD CODE left from the v1
+ * classifier builds: nothing calls it. B lines are only ever emitted from
+ * that dead path.
  *
  * Build: cc -O2 -o lhsight2 lhsight2.c
  * The borrow protocol is identical to lhsight.c (questlhsync_frame driver,
