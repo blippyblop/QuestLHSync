@@ -2553,6 +2553,32 @@ void Sync::CellSeen(int cam, const V3 &w, float peak, double t) {
 // (lamp/window: present in ~every in-view frame, peak pinned at 255). A
 // laser dot's dropouts keep its rate at ~0.7-0.8, well below the line. The
 // numbers are logged before the gate is allowed to skip anything.
+// best/median Goertzel over a binary presence ring: a laser dot's dropouts
+// arrive rotor-locked (structured gaps), a lamp's ring is a flat run of 1s
+// (no spectral peak). fs = the camera's frame period in seconds.
+static double BlinkQ(const std::vector<uint8_t> &seq, double fs) {
+  int n = (int)seq.size();
+  if (n < 32) return 0;
+  double mean = 0;
+  for (uint8_t v : seq) mean += v;
+  mean /= n;
+  static double win[64];
+  for (int i = 0; i < n; i++) win[i] = (seq[i] - mean) * (0.5 - 0.5 * std::cos(2 * 3.14159265358979 * i / (n - 1)));
+  double best = 0, sum = 0; int bestk = -1;
+  for (int k = 0; k < 48; k++) {
+    double f = (0.5 + 0.3229 * k) / fs;   // 0.5 .. 16 Hz
+    double coef = 2 * std::cos(2 * 3.14159265358979 * f), s0 = 0, s1 = 0, s2 = 0;
+    for (int i = 0; i < n; i++) { s0 = win[i] + coef * s1 - s2; s2 = s1; s1 = s0; }
+    double m = s0 * s0 + s1 * s1 - coef * s0 * s1;
+    if (m < 0) m = 0;
+    m = std::sqrt(m);
+    sum += m;
+    if (m > best) { best = m; bestk = k; }
+  }
+  if (bestk <= 0 || sum <= 0) return 0;
+  return best / (sum / 48);
+}
+
 void Sync::CellsSweep(double t) {
   long lit = 0, watched = 0; double best_rate = 0; long best_seen = 0, best_vis = 0;
   for (auto it = cells_.begin(); it != cells_.end();) {
@@ -2574,8 +2600,10 @@ void Sync::CellsSweep(double t) {
     }
     ++it;
   }
-  if (best_seen > 0)
-    log_(Fmt("cameras: highest direction presence so far: %.0f%% (%ld/%ld) -- a real station should sit near 70-85%%", best_rate * 100, best_seen, best_vis));
+  if (watched > 0 && best_seen > 0)
+    log_(Fmt("cameras: %ld blinking-direction checks, highest presence %.0f%% (%ld/%ld) -- a real station sits near 70-85%%", watched, best_rate * 100, best_seen, best_vis));
+  else
+    log_(Fmt("cameras: %zu direction cells tracked, none old enough to judge yet", cells_.size()));
   (void)watched; (void)lit;
 }
 
@@ -2626,11 +2654,16 @@ void Sync::Use(const Shot &f) {
       CellSeen(cam, W, (float)b.peak, t);
       SpotCell &cl = cells_[CellKey(cam, W)];
       size_t n = cl.seq.size();
-      if (n >= 24) {
+      if (n >= 32) {
         int ones = 0;
         for (uint8_t v : cl.seq) ones += v;
         double pres = (double)ones / n;
-        if (pres >= 0.92 && cl.amin >= 240) { spots_.cellskip++; continue; }  // always saturated, never blinks: lamp/window
+        double fs = grid_.period(cam); if (fs <= 0) fs = 1 / 0.0333;
+        double q = BlinkQ(cl.seq, fs);
+        // always in view, fully saturated, and NO blink structure anywhere in
+        // the band: a lamp or window. A laser dot's dropouts are rotor-locked
+        // and light this spectrum up.
+        if (pres >= 0.95 && q < 2.5 && cl.amin >= 240) { spots_.cellskip++; continue; }
       }
     }
     bool bright = b.peak >= kBright;
