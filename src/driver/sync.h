@@ -459,9 +459,10 @@ class Sync {
   // present in ~0.7-0.8 of the frames its direction was in view (the rotor
   // sweeps miss the exposure window at the beat period); a lamp or window is
   // ~1.0 and always saturated. Measured first, gated conservatively.
-  struct SpotCell { int cam = 0; V3 w; long seen = 0, vis = 0; float amax = 0, amin = 1e9f; double last = 0; bool lit = false;
+  struct SpotCell { int cam = 0; V3 w; long seen = 0, vis = 0; float amax = 0, amin = 1e9f; double last = 0; bool lit = false; bool inact = false;
                    std::vector<uint8_t> seqL; std::vector<uint8_t> seqS; };  // per-class presence rings: 1 = dot this frame, 0 = in view, none
   std::map<uint64_t, SpotCell> cells_;
+  std::vector<uint64_t> actk_[4];   // per camera: keys of recently-active cells (the only ones the per-line marking touches)
   std::map<int, M3> lastr_;          // per camera: last known pose (presence marking)
   double cells_next_ = 0;
   long cells_dropped_ = 0;

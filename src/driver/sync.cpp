@@ -2488,9 +2488,10 @@ void Sync::OnLine(double pc, const char *line) {
   auto lr = lastr_.find(cam);
   if (lr != lastr_.end()) {
     V3 axis = lr->second * V3{0, 0, 1};
-    for (auto &kv : cells_) {
-      SpotCell &cl = kv.second;
-      if (cl.cam != cam || cl.last < hs - 120) continue;
+    for (uint64_t ak : actk_[cam]) {
+      auto it = cells_.find(ak);
+      if (it == cells_.end()) continue;
+      SpotCell &cl = it->second;
       if (dot(cl.w, axis) <= -0.2) continue;
       std::vector<uint8_t> &ring = cls == 'L' ? cl.seqL : cl.seqS;
       ring.push_back(0);
@@ -2565,7 +2566,9 @@ uint64_t Sync::CellKey(int cam, const V3 &w) {
 }
 
 void Sync::CellSeen(int cam, const V3 &w, float peak, double t) {
-  SpotCell &cl = cells_[CellKey(cam, w)];
+  uint64_t k = CellKey(cam, w);
+  SpotCell &cl = cells_[k];
+  if (!cl.inact) { cl.inact = true; actk_[cam].push_back(k); }
   if (cl.seen == 0) { cl.cam = cam; cl.w = w; }
   else cl.w = cl.w + (w - cl.w) * 0.1;
   cl.seen++; cl.last = t;
@@ -2605,6 +2608,15 @@ static double BlinkQ(const std::vector<uint8_t> &seq, double fs) {
 
 void Sync::CellsSweep(double t) {
   long lit = 0, watched = 0; double best_rate = 0; long best_seen = 0, best_vis = 0;
+  for (int cam = 0; cam < 4; cam++) actk_[cam].clear();
+  for (auto it = cells_.begin(); it != cells_.end();) {
+    SpotCell &cl = it->second;
+    if (cl.last < t - 45) { it = cells_.erase(it); continue; }
+    if (cl.last >= t - 10 && !cl.lit) { cl.inact = true; actk_[cl.cam].push_back(CellKey(cl.cam, cl.w)); }
+    else cl.inact = false;
+    ++it;
+  }
+  while (cells_.size() > 6000) cells_.erase(cells_.begin());
   for (auto it = cells_.begin(); it != cells_.end();) {
     SpotCell &cl = it->second;
     if (cl.last < t - 120) { it = cells_.erase(it); continue; }
