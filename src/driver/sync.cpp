@@ -1499,21 +1499,54 @@ void Solver::CheckMirror(X4 &best, int &bs, const std::vector<V3> &S, const std:
   if (bs * 2 < sm) { amb_state_ = 0; best = m; bs = sm; return; }
   double db, dm;
   std::string how;
-  int fav = BodyFavours(best, m, db, dm, how);
+  int fav = 0;
   bool pick_m = false;
   int state;
   std::string why;
-  if (fav) {
-    pick_m = fav == 2;
-    state = pick_m ? 1 : 2;
-    why = how + (pick_m ? ": the mirror" : ": the fit");
-  } else if (has_x_) {
-    pick_m = Apart(m, x_, S) < Apart(best, x_, S);
-    state = 3;
-    why = "no lighthouse device near the head tells them apart: the current fit stays";
+  // geometry prior, before wearable evidence: a station cannot stand inside
+  // the volume the head actually moved through. The mirror slides one onto
+  // the walked path (the head positions are fixed data the 180-deg rotation
+  // does not follow), and the user's own body would have hit it -- so a
+  // supported station within arm's reach of a real head position loses,
+  // however the worn devices read.
+  auto intrusion = [&](const X4 &x, const std::vector<int> &cs) {
+    std::vector<V3> Pq, Zq;
+    Predict(x, S, Z, Pq, Zq);
+    double worst = 1e9;
+    for (size_t k = 0; k < Pq.size() && k < cs.size(); k++) {
+      if (cs[k] < 8) continue;   // only stations this candidate actually supports
+      for (size_t n = 0; n < r.size(); n++) {
+        double dz = Pq[k].z - r.O[n].z;
+        if (std::fabs(dz) > 0.8) continue;   // well above or below the head: walking under it is fine
+        double hd = std::hypot(Pq[k].x - r.O[n].x, Pq[k].y - r.O[n].y);
+        if (hd < worst) worst = hd;
+      }
+    }
+    return worst;   // min horizontal clearance between a supported station and any head position
+  };
+  double clear_b = intrusion(best, c), clear_m = intrusion(m, cm);
+  bool hit_b = clear_b < 0.5, hit_m = clear_m < 0.5;
+  if (hit_b != hit_m) {
+    pick_m = hit_b;   // the candidate without a station in the walked volume wins
+    state = pick_m ? 5 : 6;
+    db = clear_b;
+    dm = clear_m;
+    why = Fmt("a station %.1f m from walked head positions on the %s, %.1f m on the other: stations do not stand inside the play volume",
+              pick_m ? clear_m : clear_b, pick_m ? "mirror" : "fit", pick_m ? clear_b : clear_m);
   } else {
-    state = 4;
-    why = "no lighthouse device near the head tells them apart: wear or hold one";
+    fav = BodyFavours(best, m, db, dm, how);
+    if (fav) {
+      pick_m = fav == 2;
+      state = pick_m ? 1 : 2;
+      why = how + (pick_m ? ": the mirror" : ": the fit");
+    } else if (has_x_) {
+      pick_m = Apart(m, x_, S) < Apart(best, x_, S);
+      state = 3;
+      why = "no lighthouse device near the head tells them apart: the current fit stays";
+    } else {
+      state = 4;
+      why = "no lighthouse device near the head tells them apart: wear or hold one";
+    }
   }
   if (state != amb_state_)
     log_(Fmt("mirror check: yaw %+.1f (support %d, devices %s from the head) and its mirror yaw %+.1f (support %d, %s) "
