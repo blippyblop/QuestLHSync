@@ -2513,6 +2513,13 @@ void Sync::OnLine(double pc, const char *line) {
       }
     }
   }
+  if (cls == 'S') {
+    // S dots are evidence (already marked into the cells above) and never
+    // enter the timing grid or the solver: the pose-time model is built for
+    // one frame class, and mixing them bent rays alternately by ~4 ms.
+    spots_.sframe += nb;
+    return;
+  }
   std::vector<Spot> bl;
   {
     const char *s = line + off;
@@ -2526,6 +2533,7 @@ void Sync::OnLine(double pc, const char *line) {
   nb = (int)bl.size();
   spots_.frames++;
   spots_.seen += nb;
+  if (!nb) return;   // dotless frames feed the grid above only
   if (!have_optics_) { spots_.other += nb; return; }
   double hg = have_lag ? hs - lag : std::numeric_limits<double>::quiet_NaN();  // frame time, headset clock
   if (have_lag && grid_.period(cam) > 0) solver_.SetFramePeriod(grid_.period(cam));
