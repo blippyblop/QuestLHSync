@@ -2468,8 +2468,10 @@ void Sync::OnLine(double pc, const char *line) {
   if (cfg_.arrival_clock) clock_.AddArrival(pc, hs);
   double lag = 0;
   // the Frame stamps its frames itself; the Quest's are when lhsight found them, the grid takes the poll lag off. On
-  // the Frame the grid still learns the frame period, for the channel check
-  bool grid_lag = nb >= 0 && grid_.Lag(cam, hs, lag);
+  // the Frame the grid still learns the frame period, for the channel check. Tagged-S lines stay out of the grid too:
+  // interleaved with L their 8.4 ms offset halves the median gap and Learn can never fold them (period stuck at 0 ->
+  // CheckIdentity dead). L lines alone give the true frame period; S lines are evidence only (below).
+  bool grid_lag = nb >= 0 && xcls != 'S' && grid_.Lag(cam, hs, lag);
   if (optics_.exact_time()) lag = 0;
   bool have_lag = nb >= 0 && (optics_.exact_time() || grid_lag);
   if (nb >= 0) {  // the frame period: log it when it's found or moves
@@ -2484,9 +2486,12 @@ void Sync::OnLine(double pc, const char *line) {
   // its average, is the modulation signal: a laser dot's misses arrive in
   // rotor-locked bursts; a lamp's ring is a flat run of 1s. The cone uses the
   // camera's last known pose -- it moves slowly, fine for counting.
-  char cls = xcls ? xcls : (nb > 0 ? 'S' : 'L');   // untagged lines are Quest semantics: dots are short-frame
+  // Steam Frame only (the cells exist for the short-presence gate below);
+  // Quest lines are untagged and keep stock behavior entirely.
+  char cls = xcls ? xcls : (nb > 0 ? 'S' : 'L');   // evidence class: untagged dots sit on short frames (Quest)
+  bool solve = !xcls || xcls == 'L';               // untagged lines are stock Quest semantics: dots are rays
   auto lr = lastr_.find(cam);
-  if (lr != lastr_.end()) {
+  if (optics_.exact_time() && lr != lastr_.end()) {
     V3 axis = lr->second * V3{0, 0, 1};
     for (uint64_t ak : actk_[cam]) {
       auto it = cells_.find(ak);
@@ -2496,6 +2501,7 @@ void Sync::OnLine(double pc, const char *line) {
       std::vector<uint8_t> &ring = cls == 'L' ? cl.seqL : cl.seqS;
       ring.push_back(0);
       if (ring.size() > 64) ring.erase(ring.begin());
+      if (cls == 'L') cl.vis++;   // the never-blinks rate's denominator: long frames with the direction in view
     }
     if (nb > 0) {
       const char *s2 = line + off;
@@ -2514,10 +2520,12 @@ void Sync::OnLine(double pc, const char *line) {
       }
     }
   }
-  if (cls == 'S') {
-    // S dots are evidence (already marked into the cells above) and never
-    // enter the timing grid or the solver: the pose-time model is built for
-    // one frame class, and mixing them bent rays alternately by ~4 ms.
+  if (!solve) {
+    // tagged-S dots are evidence (already marked into the cells above) and
+    // never enter the timing grid or the solver: the pose-time model is built
+    // for one frame class, and mixing them bent rays alternately by ~4 ms.
+    // Untagged lines (stock lhsight on Quest) are short-frame dots that DO
+    // solve -- only lhsight2's explicit 'S' tag makes a line evidence-only.
     spots_.sframe += nb;
     return;
   }
@@ -2542,7 +2550,9 @@ void Sync::OnLine(double pc, const char *line) {
   if (!clock_.Map(hs - (have_lag ? lag : 0.0), grid_pc)) { spots_.other += nb; return; }
   double expo = expo_;
   double t = grid_pc - expo - (have_lag ? 0.0 : kLagFallback);
-  waiting_.push_back({pc, t, hg, grid_pc, cam, have_lag, cls, std::move(bl)});
+  waiting_.push_back({pc, t, hg, grid_pc, cam, have_lag, 'L', std::move(bl)});
+  // everything that reaches here solves: tagged-S was returned above, untagged
+  // (Quest) dots solve regardless of their evidence class -- hence the literal
   // the frames whose head pose is in (one after their pose time), or that waited long enough, oldest first
   while (!waiting_.empty()) {
     V3 lp;
@@ -2578,33 +2588,9 @@ void Sync::CellSeen(int cam, const V3 &w, float peak, double t) {
 
 // periodic: promote near-continuous fully-saturated directions to "lit"
 // (lamp/window: present in ~every in-view frame, peak pinned at 255). A
-// laser dot's dropouts keep its rate at ~0.7-0.8, well below the line. The
-// numbers are logged before the gate is allowed to skip anything.
-// best/median Goertzel over a binary presence ring: a laser dot's dropouts
-// arrive rotor-locked (structured gaps), a lamp's ring is a flat run of 1s
-// (no spectral peak). fs = the camera's frame period in seconds.
-static double BlinkQ(const std::vector<uint8_t> &seq, double fs) {
-  int n = (int)seq.size();
-  if (n < 32) return 0;
-  double mean = 0;
-  for (uint8_t v : seq) mean += v;
-  mean /= n;
-  static double win[64];
-  for (int i = 0; i < n; i++) win[i] = (seq[i] - mean) * (0.5 - 0.5 * std::cos(2 * 3.14159265358979 * i / (n - 1)));
-  double best = 0, sum = 0; int bestk = -1;
-  for (int k = 0; k < 48; k++) {
-    double f = (0.5 + 0.3229 * k) / fs;   // 0.5 .. 16 Hz
-    double coef = 2 * std::cos(2 * 3.14159265358979 * f), s0 = 0, s1 = 0, s2 = 0;
-    for (int i = 0; i < n; i++) { s0 = win[i] + coef * s1 - s2; s2 = s1; s1 = s0; }
-    double m = s0 * s0 + s1 * s1 - coef * s0 * s1;
-    if (m < 0) m = 0;
-    m = std::sqrt(m);
-    sum += m;
-    if (m > best) { best = m; bestk = k; }
-  }
-  if (bestk <= 0 || sum <= 0) return 0;
-  return best / (sum / 48);
-}
+// laser dot's dropouts keep its rate at ~0.7-0.8, well below the line -- and
+// in a dim room its presence can peg anyway, so this only NAMES steady
+// directions for the log; the short-frame gate below does the skipping.
 
 void Sync::CellsSweep(double t) {
   long lit = 0, watched = 0; double best_rate = 0; long best_seen = 0, best_vis = 0;
@@ -2612,24 +2598,35 @@ void Sync::CellsSweep(double t) {
   for (auto it = cells_.begin(); it != cells_.end();) {
     SpotCell &cl = it->second;
     if (cl.last < t - 45) { it = cells_.erase(it); continue; }
-    if (cl.last >= t - 10 && !cl.lit) { cl.inact = true; actk_[cl.cam].push_back(CellKey(cl.cam, cl.w)); }
+    if (cl.last >= t - 10) { cl.inact = true; actk_[cl.cam].push_back(CellKey(cl.cam, cl.w)); }
     else cl.inact = false;
     ++it;
   }
-  while (cells_.size() > 6000) cells_.erase(cells_.begin());
+  if (cells_.size() > 6000) {  // shed the coldest, not unordered_map's arbitrary front
+    size_t shed = cells_.size() - 6000;
+    std::vector<uint64_t> keys;
+    keys.reserve(cells_.size());
+    for (auto &kv : cells_) keys.push_back(kv.first);
+    std::nth_element(keys.begin(), keys.begin() + shed, keys.end(),
+                     [&](uint64_t a, uint64_t b) { return cells_.at(a).last < cells_.at(b).last; });
+    keys.resize(shed);
+    for (uint64_t k : keys) cells_.erase(k);
+  }
   for (auto it = cells_.begin(); it != cells_.end();) {
     SpotCell &cl = it->second;
     if (cl.last < t - 120) { it = cells_.erase(it); continue; }
     if (cl.vis >= 60 && cl.seen >= 16) {
       watched++;
       double rate = (double)cl.seen / cl.vis;
-      int n = 0; float mx = 0, mn = 1e9f;
-      for (uint8_t v : cl.seqL) if (v >= 200) { n++; if (mx < v) mx = v; if (mn > v) mn = v; }
-      bool tight = n >= 16 && mn >= 240 && mx - mn < 48;   // most sightings fully saturated and tight
+      // lifetime peaks: a lamp's sightings saturate and stay saturated; a dot
+      // dipping through beat nulls swings (and, in a dim room, its long-frame
+      // presence can peg anyway -- which is why nothing here GATES, it only
+      // names the steady directions; short-frame presence does the gating)
+      bool tight = cl.amin >= 240 && cl.amax - cl.amin < 48;
       if (!cl.lit && rate >= 0.85 && tight) {
         cl.lit = true;
-        log_(Fmt("cameras: a direction present %.0f%% of %ld in-view frames (saturated sightings tight, n=%ld) never blinks: treating it as a lamp or window",
-                 rate * 100, cl.vis, (long)n));
+        log_(Fmt("cameras: a direction present %.0f%% of %ld in-view frames (peak %ld..%ld) never blinks: a lamp, window or other steady source",
+                 rate * 100, cl.vis, (long)cl.amin, (long)cl.amax));
       }
       if (rate > best_rate && cl.vis >= 120) { best_rate = rate; best_seen = cl.seen; best_vis = cl.vis; }
       if (cl.lit) lit++;
@@ -2637,10 +2634,10 @@ void Sync::CellsSweep(double t) {
     ++it;
   }
   if (watched > 0 && best_seen > 0)
-    log_(Fmt("cameras: %ld blinking-direction checks, highest presence %.0f%% (%ld/%ld) -- a real station sits near 70-85%%", watched, best_rate * 100, best_seen, best_vis));
+    log_(Fmt("cameras: %ld presence checks, highest %.0f%% (%ld/%ld), %ld judged steady -- a real station sits near 70-85%%",
+             watched, best_rate * 100, best_seen, best_vis, lit));
   else
     log_(Fmt("cameras: %zu direction cells tracked, none old enough to judge yet", cells_.size()));
-  (void)watched; (void)lit;
 }
 
 void Sync::Use(const Shot &f) {
@@ -2679,24 +2676,24 @@ void Sync::Use(const Shot &f) {
     if (npx > kMaxPx) { spots_.big++; continue; }
     V3 o, d;
     if (!optics_.Ray(cam, x10 / 10.0 - 0.5, y10 / 10.0 - 0.5, o, d)) { spots_.other++; continue; }
-    if (have_lag && cfg_.learn_timing) timing_.Record(grid_pc, o, d, hg, cam, b.peak >= kBright);
     if (g_ray_dump) {
       V3 O = p + R * o, D = R * d;
       fprintf(g_ray_dump, "R %.6f %d %.6f %.6f %.6f %.7f %.7f %.7f %.6f %.6f %.6f %.1f %d\n", t, cam, O.x, O.y, O.z, D.x,
               D.y, D.z, p.x, p.y, p.z, w, b.peak);
     }
     if (w > kWmax) { spots_.fast++; continue; }
-    {
+    if (optics_.exact_time()) {  // Steam Frame only; Quest keeps stock behavior
       V3 W = R * d;
       CellSeen(cam, W, (float)b.peak, t);
       SpotCell &cl = cells_[CellKey(cam, W)];
-      // Steam Frame only; Quest keeps stock behavior.
-      // PRIMARY filter: short-frame presence. A mains source radiates
-      // continuously, so even the microsecond S exposure catches it
-      // (measured lamps: 0.38-1.14 of long presence); the lighthouse's
-      // sweeps are microsecond-wide and unsynced, so it is ~absent from S
-      // frames (measured ~0). >= 15% S-presence with >= 8 S samples = mains
-      // source -> skip.
+      // PRIMARY filter: short-frame presence. The lighthouse's sweeps are
+      // microsecond-wide and unsynced with the S exposure, so a real dot is
+      // ~absent from S frames (measured 0.00 over thousands of frames). A
+      // continuously-radiating source (lamp, window, steady IR) shows up on
+      // S too: skip the direction. Measured on the lhscan captures: direct
+      // lamp images sit at 0.15-0.5 S-presence (some PWM lamps lower -- those
+      // are left for kMaxPx and the solver's geometry), and the two
+      // steady-IR sources in the lighthouse-only capture land at 0.17-0.22.
       //
       // The L-presence continuity test is deliberately GONE: in a dim room
       // the long exposure stretches past the sweep period, every long frame
@@ -2705,13 +2702,14 @@ void Sync::Use(const Shot &f) {
       // Short-frame presence has the clean measured margin, so it alone
       // gates.
       size_t ns = cl.seqS.size();
-      if (optics_.exact_time() && ns >= 8) {
+      if (ns >= 8) {
         int os = 0;
         for (uint8_t v : cl.seqS) os += v;
         double ps = (double)os / ns;
         if (ps >= 0.15) { spots_.cellskip++; continue; }
       }
     }
+    if (have_lag && cfg_.learn_timing) timing_.Record(grid_pc, o, d, hg, cam, b.peak >= kBright);  // gated rays only: lamps must not steer exposure learning
     bool bright = b.peak >= kBright;
     solver_.Add(t, p + R * o, R * d, hg, cam, bright);  // dim ones too: they tell when the room is too light
     if (bright || solver_.starved()) spots_.used++;
@@ -2729,7 +2727,7 @@ std::string Sync::Describe(const Spots &a, const Spots &b) {
   part(b.big - a.big, "lamps or windows");
   part(b.other - a.other, "without a headset pose");
   part(b.dim - a.dim, "dim, kept for a room too light for the dots to saturate");
-  part(b.cellskip - a.cellskip, "always-saturated sources that never blink");
+  part(b.cellskip - a.cellskip, "directions also lit on short frames (lamps, steady IR)");
   part(b.sframe - a.sframe, "short-frame evidence dots");
   return Fmt("%ld bright spots, %ld used", n, b.used - a.used) + (why.empty() ? "" : " (" + why + ")");
 }
