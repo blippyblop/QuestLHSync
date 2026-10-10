@@ -637,36 +637,18 @@ static void frame(int k, int i, const struct v4l2_buffer *b) {
    * decaying running max, so a few missed frames don't break the split. */
   if (c->rmax < hi) c->rmax = hi; else c->rmax = (int)(c->rmax * 0.97);
   int is_short = kk >= 2 && mean*10 < c->rmax*6;
-  if (!is_short) {
-    for (int y = 0; y < c->h; y++) memcpy(scratch + (size_t)y*c->w, p + (size_t)y*c->stride, c->w);
-  }
+  char cls = is_short ? 'S' : 'L';
+  /* both classes are scanned and emitted, class-tagged; the PC knows which
+   * is which and does the modulation/gating classification itself */
+  for (int y = 0; y < c->h; y++) memcpy(scratch + (size_t)y*c->w, p + (size_t)y*c->stride, c->w);
   cpu_access(c->fd[i], 1);
   if (torn(c, i, b)) return;
-
-  if (is_short) {
-    /* LONG-FRAMES-ONLY TEST: shorts are not scanned or tracked at all. */
-    out("F %d %u %llu %d -1", k, b->sequence, (unsigned long long)t_us, mean);
-    return;
-  }
-  c->longs++;
-  check_rate(c);
-  u64 t0 = now_ns();
   u64 sx[MAXB], sy[MAXB]; u32 np[MAXB]; int pk[MAXB]; u32 sat[MAXB];
   int T = mean*4/10; if (T < 64) T = 64;
   int nc = (c->w>>4)*(c->h>>4);
   memset(hot, 0, (size_t)nc);
   int nbl = blobs(c->w, c->h, 250, 1, 0, sx, sy, np, pk, sat);
   if (T < 250) nbl = blobs(c->w, c->h, T, 0, nbl, sx, sy, np, pk, sat);
-  scan_ns += now_ns() - t0; nscan++;
-  double tn = t_us/1e6;
-  if (c->nlfts < 32) c->lfts[c->nlfts++] = tn;
-  else { memmove(c->lfts, c->lfts+1, 31*sizeof *c->lfts); c->lfts[31] = tn; }
-  check_rate(c);
-  track_update(c, tn, sx, sy, np, pk, nbl, 0);
-  /* Raw emission of every saturated-core blob, brightest first. The lamp vs
-   * lighthouse decision happens PC-side now (per-direction presence rates
-   * with coverage denominators); starving the PC of rays cost more than any
-   * frame-side filter gained. The beat analysis runs as B diagnostics. */
   int cand[MAXB], nc2 = 0;
   for (int e = 0; e < nbl; e++) {
     if (pk[e] < 250 || (int)np[e] > 150 || sat[e] < 4) continue;
@@ -682,7 +664,7 @@ static void frame(int k, int i, const struct v4l2_buffer *b) {
     L2 += snprintf(bl+L2, sizeof bl-L2, " %lld %lld %u %d", (long long)sx[cand[e]]/np[cand[e]], (long long)sy[cand[e]]/np[cand[e]], np[cand[e]], pk[cand[e]]);
     n++;
   }
-  out("F %d %u %llu %d %d%s", k, b->sequence, (unsigned long long)t_us, mean, n, bl);
+  out("F %d %u %llu %d %d%s %c", k, b->sequence, (unsigned long long)t_us, mean, n, bl, cls);
 }
 static void poll_camera(int k) {
   struct cam *c = &C[k];

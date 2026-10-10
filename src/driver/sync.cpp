@@ -2456,6 +2456,12 @@ void Sync::OnLine(double pc, const char *line) {
   long long tus;
   int mean, off = 0;
   if (sscanf(line, "F %d %u %lld %d %d%n", &cam, &k, &tus, &mean, &nb, &off) < 5) return;
+  char xcls = 0;   // trailing class tag: 'L' or 'S' (lhsight2); absent on Quest (dots are short-frame)
+  {
+    const char *s = line + off;
+    while (*s == ' ') s++;
+    if (s[0] && !s[1] && (s[0] == 'L' || s[0] == 'S')) xcls = s[0];
+  }
   nframes_++;
   std::lock_guard<std::mutex> g(net_);
   double hs = tus / 1e6;
@@ -2478,16 +2484,33 @@ void Sync::OnLine(double pc, const char *line) {
   // its average, is the modulation signal: a laser dot's misses arrive in
   // rotor-locked bursts; a lamp's ring is a flat run of 1s. The cone uses the
   // camera's last known pose -- it moves slowly, fine for counting.
+  char cls = xcls ? xcls : (nb > 0 ? 'S' : 'L');   // untagged lines are Quest semantics: dots are short-frame
   auto lr = lastr_.find(cam);
-  double hs_m = hs;
   if (lr != lastr_.end()) {
     V3 axis = lr->second * V3{0, 0, 1};
     for (auto &kv : cells_) {
       SpotCell &cl = kv.second;
-      if (cl.cam != cam || cl.last < hs_m - 120) continue;
+      if (cl.cam != cam || cl.last < hs - 120) continue;
       if (dot(cl.w, axis) <= -0.2) continue;
-      cl.seq.push_back(0);
-      if (cl.seq.size() > 64) cl.seq.erase(cl.seq.begin());
+      std::vector<uint8_t> &ring = cls == 'L' ? cl.seqL : cl.seqS;
+      ring.push_back(0);
+      if (ring.size() > 64) ring.erase(ring.begin());
+    }
+    if (nb > 0) {
+      const char *s2 = line + off;
+      for (int i = 0; i < nb; i++) {
+        int x10, y10, npx2, peak2, used = 0;
+        if (sscanf(s2, " %d %d %d %d%n", &x10, &y10, &npx2, &peak2, &used) < 4) break;
+        s2 += used;
+        V3 o, d;
+        if (optics_.Ray(cam, x10 / 10.0 - 0.5, y10 / 10.0 - 0.5, o, d)) {
+          V3 W = lr->second * d;
+          auto it = cells_.find(CellKey(cam, W));
+          if (it != cells_.end() && !it->second.seqL.empty() && !it->second.seqS.empty()) {
+            (cls == 'L' ? it->second.seqL : it->second.seqS).back() = 1;
+          }
+        }
+      }
     }
   }
   std::vector<Spot> bl;
@@ -2498,13 +2521,6 @@ void Sync::OnLine(double pc, const char *line) {
       if (sscanf(s, " %d %d %d %d%n", &x10, &y10, &npx, &peak, &used) < 4) break;
       s += used;
       bl.push_back({x10, y10, npx, peak});
-      V3 o, d;
-      auto lr2 = lastr_.find(cam);
-      if (lr2 != lastr_.end() && optics_.Ray(cam, x10 / 10.0 - 0.5, y10 / 10.0 - 0.5, o, d)) {
-        V3 W = lr2->second * d;
-        auto it = cells_.find(CellKey(cam, W));
-        if (it != cells_.end() && !it->second.seq.empty()) it->second.seq.back() = 1;
-      }
     }
   }
   nb = (int)bl.size();
@@ -2517,7 +2533,7 @@ void Sync::OnLine(double pc, const char *line) {
   if (!clock_.Map(hs - (have_lag ? lag : 0.0), grid_pc)) { spots_.other += nb; return; }
   double expo = expo_;
   double t = grid_pc - expo - (have_lag ? 0.0 : kLagFallback);
-  waiting_.push_back({pc, t, hg, grid_pc, cam, have_lag, std::move(bl)});
+  waiting_.push_back({pc, t, hg, grid_pc, cam, have_lag, cls, std::move(bl)});
   // the frames whose head pose is in (one after their pose time), or that waited long enough, oldest first
   while (!waiting_.empty()) {
     V3 lp;
@@ -2588,7 +2604,7 @@ void Sync::CellsSweep(double t) {
       watched++;
       double rate = (double)cl.seen / cl.vis;
       int n = 0; float mx = 0, mn = 1e9f;
-      for (uint8_t v : cl.seq) if (v >= 200) { n++; if (mx < v) mx = v; if (mn > v) mn = v; }
+      for (uint8_t v : cl.seqL) if (v >= 200) { n++; if (mx < v) mx = v; if (mn > v) mn = v; }
       bool tight = n >= 16 && mn >= 240 && mx - mn < 48;   // most sightings fully saturated and tight
       if (!cl.lit && rate >= 0.85 && tight) {
         cl.lit = true;
@@ -2608,6 +2624,7 @@ void Sync::CellsSweep(double t) {
 }
 
 void Sync::Use(const Shot &f) {
+  if (f.cls == 'S') { spots_.sframe += (int)f.bl.size(); return; }   // S dots are evidence, not rays
   const double t = f.t, hg = f.hg, grid_pc = f.grid_pc;
   const int cam = f.cam, nb = (int)f.bl.size();
   const bool have_lag = f.have_lag;
@@ -2653,17 +2670,17 @@ void Sync::Use(const Shot &f) {
       V3 W = R * d;
       CellSeen(cam, W, (float)b.peak, t);
       SpotCell &cl = cells_[CellKey(cam, W)];
-      size_t n = cl.seq.size();
-      if (n >= 32) {
-        int ones = 0;
-        for (uint8_t v : cl.seq) ones += v;
-        double pres = (double)ones / n;
-        double fs = grid_.period(cam); if (fs <= 0) fs = 1 / 0.0333;
-        double q = BlinkQ(cl.seq, fs);
-        // always in view, fully saturated, and NO blink structure anywhere in
-        // the band: a lamp or window. A laser dot's dropouts are rotor-locked
-        // and light this spectrum up.
-        if (pres >= 0.95 && q < 2.5 && cl.amin >= 240) { spots_.cellskip++; continue; }
+      size_t nl = cl.seqL.size(), ns = cl.seqS.size();
+      if (nl >= 16 && ns >= 8) {
+        int ol = 0, os = 0;
+        for (uint8_t v : cl.seqL) ol += v;
+        for (uint8_t v : cl.seqS) os += v;
+        double pl = (double)ol / nl, ps = (double)os / ns;
+        // Steam Frame: a ceiling light is visible in BOTH exposures (measured
+        // S/L presence 0.38-1.14 for lamps; the lighthouse is ~0 in shorts --
+        // the microsecond S gate never catches the microsecond sweeps). So
+        // short-frame visibility at a stable direction = mains source.
+        if (optics_.exact_time() && ps >= 0.15 && pl >= 0.2) { spots_.cellskip++; continue; }
       }
     }
     bool bright = b.peak >= kBright;
@@ -2684,6 +2701,7 @@ std::string Sync::Describe(const Spots &a, const Spots &b) {
   part(b.other - a.other, "without a headset pose");
   part(b.dim - a.dim, "dim, kept for a room too light for the dots to saturate");
   part(b.cellskip - a.cellskip, "always-saturated sources that never blink");
+  part(b.sframe - a.sframe, "short-frame evidence dots");
   return Fmt("%ld bright spots, %ld used", n, b.used - a.used) + (why.empty() ? "" : " (" + why + ")");
 }
 

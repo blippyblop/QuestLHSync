@@ -453,14 +453,14 @@ class Sync {
   };
   Status GetStatus(double now);
   // the cameras' bright spots so far, and what became of them
-  struct Spots { long frames = 0, seen = 0, used = 0, still = 0, fast = 0, big = 0, other = 0, dim = 0, cellskip = 0; };
+  struct Spots { long frames = 0, seen = 0, used = 0, still = 0, fast = 0, big = 0, other = 0, dim = 0, cellskip = 0, sframe = 0; };
   Spots spots() { std::lock_guard<std::mutex> g(net_); return spots_; }
   // per-world-direction dot history (PC-side presence check): a laser dot is
   // present in ~0.7-0.8 of the frames its direction was in view (the rotor
   // sweeps miss the exposure window at the beat period); a lamp or window is
   // ~1.0 and always saturated. Measured first, gated conservatively.
   struct SpotCell { int cam = 0; V3 w; long seen = 0, vis = 0; float amax = 0, amin = 1e9f; double last = 0; bool lit = false;
-                   std::vector<uint8_t> seq; };  // presence ring: 1 = dot this frame, 0 = in view, none
+                   std::vector<uint8_t> seqL; std::vector<uint8_t> seqS; };  // per-class presence rings: 1 = dot this frame, 0 = in view, none
   std::map<uint64_t, SpotCell> cells_;
   std::map<int, M3> lastr_;          // per camera: last known pose (presence marking)
   double cells_next_ = 0;
@@ -518,7 +518,7 @@ class Sync {
   long img_moved_ = 0, img_still_ = 0;  // under net_: of those, while SteamVR's headset stands still
   // under net_: short frames waiting for their head pose (kPoseWait), in arrival order
   struct Spot { int x10, y10, npx, peak; };
-  struct Shot { double pc, t, hg, grid_pc; int cam; bool have_lag; std::vector<Spot> bl; };
+  struct Shot { double pc, t, hg, grid_pc; int cam; bool have_lag; char cls = 'L'; std::vector<Spot> bl; };
   std::deque<Shot> waiting_;
   void Use(const Shot &f);  // under net_
   double still_since_ = -1;
