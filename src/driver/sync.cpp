@@ -2679,16 +2679,26 @@ void Sync::Use(const Shot &f) {
       CellSeen(cam, W, (float)b.peak, t);
       SpotCell &cl = cells_[CellKey(cam, W)];
       size_t nl = cl.seqL.size(), ns = cl.seqS.size();
-      if (nl >= 16 && ns >= 8) {
-        int ol = 0, os = 0;
+      // Steam Frame only; Quest keeps stock behavior.
+      if (optics_.exact_time() && nl >= 16) {
+        int ol = 0;
         for (uint8_t v : cl.seqL) ol += v;
-        for (uint8_t v : cl.seqS) os += v;
-        double pl = (double)ol / nl, ps = (double)os / ns;
-        // Steam Frame: a ceiling light is visible in BOTH exposures (measured
-        // S/L presence 0.38-1.14 for lamps; the lighthouse is ~0 in shorts --
-        // the microsecond S gate never catches the microsecond sweeps). So
-        // short-frame visibility at a stable direction = mains source.
-        if (optics_.exact_time() && ps >= 0.15 && pl >= 0.2) { spots_.cellskip++; continue; }
+        double pl = (double)ol / nl;
+        // 1) continuity: a lamp/window is present in ~every long frame its
+        //    direction is in view, always saturated. The swept laser drops
+        //    out at the rotor beat -- measured ~0.79, far below this line.
+        if (nl >= 32 && pl >= 0.97 && cl.amin >= 240 && cl.amax - cl.amin < 32) {
+          spots_.cellskip++; continue;
+        }
+        // 2) short-frame visibility: a mains source is bright enough that
+        //    even the microsecond S gate catches it (measured 0.38-1.14 of
+        //    its long presence); the lighthouse is ~0 there.
+        if (ns >= 8) {
+          int os = 0;
+          for (uint8_t v : cl.seqS) os += v;
+          double ps = (double)os / ns;
+          if (ps >= 0.15 && pl >= 0.2) { spots_.cellskip++; continue; }
+        }
       }
     }
     bool bright = b.peak >= kBright;
