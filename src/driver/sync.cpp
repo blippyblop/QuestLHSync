@@ -2678,27 +2678,26 @@ void Sync::Use(const Shot &f) {
       V3 W = R * d;
       CellSeen(cam, W, (float)b.peak, t);
       SpotCell &cl = cells_[CellKey(cam, W)];
-      size_t nl = cl.seqL.size(), ns = cl.seqS.size();
       // Steam Frame only; Quest keeps stock behavior.
-      if (optics_.exact_time() && nl >= 16) {
-        int ol = 0;
-        for (uint8_t v : cl.seqL) ol += v;
-        double pl = (double)ol / nl;
-        // 1) continuity: a lamp/window is present in ~every long frame its
-        //    direction is in view, always saturated. The swept laser drops
-        //    out at the rotor beat -- measured ~0.79, far below this line.
-        if (nl >= 32 && pl >= 0.97 && cl.amin >= 240 && cl.amax - cl.amin < 32) {
-          spots_.cellskip++; continue;
-        }
-        // 2) short-frame visibility: a mains source is bright enough that
-        //    even the microsecond S gate catches it (measured 0.38-1.14 of
-        //    its long presence); the lighthouse is ~0 there.
-        if (ns >= 8) {
-          int os = 0;
-          for (uint8_t v : cl.seqS) os += v;
-          double ps = (double)os / ns;
-          if (ps >= 0.15 && pl >= 0.2) { spots_.cellskip++; continue; }
-        }
+      // PRIMARY filter: short-frame presence. A mains source radiates
+      // continuously, so even the microsecond S exposure catches it
+      // (measured lamps: 0.38-1.14 of long presence); the lighthouse's
+      // sweeps are microsecond-wide and unsynced, so it is ~absent from S
+      // frames (measured ~0). >= 15% S-presence with >= 8 S samples = mains
+      // source -> skip.
+      //
+      // The L-presence continuity test is deliberately GONE: in a dim room
+      // the long exposure stretches past the sweep period, every long frame
+      // catches a flash, the laser's presence pegs at 1.0 and ANY
+      // presence-threshold on the L ring false-negatives the real station.
+      // Short-frame presence has the clean measured margin, so it alone
+      // gates.
+      size_t ns = cl.seqS.size();
+      if (optics_.exact_time() && ns >= 8) {
+        int os = 0;
+        for (uint8_t v : cl.seqS) os += v;
+        double ps = (double)os / ns;
+        if (ps >= 0.15) { spots_.cellskip++; continue; }
       }
     }
     bool bright = b.peak >= kBright;
