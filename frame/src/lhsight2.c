@@ -663,25 +663,25 @@ static void frame(int k, int i, const struct v4l2_buffer *b) {
   else { memmove(c->lfts, c->lfts+1, 31*sizeof *c->lfts); c->lfts[31] = tn; }
   check_rate(c);
   track_update(c, tn, sx, sy, np, pk, nbl, 0);
-  /* Raw emission of every saturated-core blob, brightest first. The frame is
-   * a sensor, not a classifier: the PC pairs each dot with the SLAM pose at
-   * exposure time and its geometric gates decide what is a base station.
-   * Temporal filtering here only starves it. The beat analysis runs as B
-   * diagnostics. */
-  int cand[MAXB], nc2 = 0;
-  for (int e = 0; e < nbl; e++) {
-    if (pk[e] < 250 || (int)np[e] > 150 || sat[e] < 4) continue;
-    cand[nc2++] = e;
-  }
-  for (int a = 1; a < nc2; a++) {
-    int v = cand[a], b2 = a-1;
-    while (b2 >= 0 && sat[cand[b2]] < sat[v]) { cand[b2+1] = cand[b2]; b2--; }
-    cand[b2+1] = v;
-  }
+  /* Emission = PERSISTENCE + BEAT. Only tracks that have stayed alive for
+   * >= 2.5 s (hits >= 75: transient wall spatter dies with the head motion
+   * that created it) AND hold the rotor beat on a clean frame grid
+   * (T_ACTIVE: lamps are constant and never confirm; rate gates keep the
+   * spectrum honest) get their dots sent. The PC gates geometrically on
+   * top. */
   char bl[1800] = {0}; int L2 = 0, n = 0;
-  for (int e = 0; e < nc2 && n < 16; e++) {
-    L2 += snprintf(bl+L2, sizeof bl-L2, " %lld %lld %u %d", (long long)sx[cand[e]]/np[cand[e]], (long long)sy[cand[e]]/np[cand[e]], np[cand[e]], pk[cand[e]]);
-    n++;
+  for (int i2 = 0; i2 < MAXTRACKS; i2++) {
+    struct track *tr = &c->tr[i2];
+    if (!tr->used || tr->state != T_ACTIVE || tr->hits < 75) continue;
+    for (int e = 0; e < nbl; e++) {
+      float bx = sx[e]/10.0f, by = sy[e]/10.0f;
+      float dx = tr->x-bx, dy = tr->y-by;
+      if (dx*dx+dy*dy > RADIUS2) continue;
+      L2 += snprintf(bl+L2, sizeof bl-L2, " %lld %lld %u %d", (long long)sx[e]/np[e], (long long)sy[e]/np[e], np[e], pk[e]);
+      n++;
+      break;
+    }
+    if (L2 > (int)sizeof bl - 64) break;
   }
   out("F %d %u %llu %d %d%s", k, b->sequence, (unsigned long long)t_us, mean, n, bl);
 }

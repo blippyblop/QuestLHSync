@@ -2554,22 +2554,28 @@ void Sync::CellSeen(int cam, const V3 &w, float peak, double t) {
 // laser dot's dropouts keep its rate at ~0.7-0.8, well below the line. The
 // numbers are logged before the gate is allowed to skip anything.
 void Sync::CellsSweep(double t) {
-  long lit = 0, watched = 0;
+  long lit = 0, watched = 0; double best_rate = 0; long best_seen = 0, best_vis = 0;
   for (auto it = cells_.begin(); it != cells_.end();) {
     SpotCell &cl = it->second;
     if (cl.last < t - 120) { it = cells_.erase(it); continue; }
     if (cl.vis >= 60 && cl.seen >= 16) {
       watched++;
       double rate = (double)cl.seen / cl.vis;
-      if (!cl.lit && rate >= 0.97 && cl.amin >= 240 && cl.amax - cl.amin < 32) {
+      int n = 0; float mx = 0, mn = 1e9f;
+      for (uint8_t v : cl.seq) if (v >= 200) { n++; if (mx < v) mx = v; if (mn > v) mn = v; }
+      bool tight = n >= 16 && mn >= 240 && mx - mn < 48;   // most sightings fully saturated and tight
+      if (!cl.lit && rate >= 0.85 && tight) {
         cl.lit = true;
-        log_(Fmt("cameras: a direction seen %ld times in %ld in-view frames (%.0f%% present, peak %ld..%ld) never blinks: treating it as a lamp or window",
-                 cl.seen, cl.vis, rate * 100, (long)cl.amin, (long)cl.amax));
+        log_(Fmt("cameras: a direction present %.0f%% of %ld in-view frames (saturated sightings tight, n=%ld) never blinks: treating it as a lamp or window",
+                 rate * 100, cl.vis, (long)n));
       }
+      if (rate > best_rate && cl.vis >= 120) { best_rate = rate; best_seen = cl.seen; best_vis = cl.vis; }
       if (cl.lit) lit++;
     }
     ++it;
   }
+  if (best_seen > 0)
+    log_(Fmt("cameras: highest direction presence so far: %.0f%% (%ld/%ld) -- a real station should sit near 70-85%%", best_rate * 100, best_seen, best_vis));
   (void)watched; (void)lit;
 }
 
