@@ -2473,7 +2473,23 @@ void Sync::OnLine(double pc, const char *line) {
       was = p;
     }
   }
-  if (nb < 0) return;
+  // presence marking: EVERY frame counts coverage for the direction cells it
+  // had in view (0), and blob frames mark their dots (1). The sequence, not
+  // its average, is the modulation signal: a laser dot's misses arrive in
+  // rotor-locked bursts; a lamp's ring is a flat run of 1s. The cone uses the
+  // camera's last known pose -- it moves slowly, fine for counting.
+  auto lr = lastr_.find(cam);
+  double hs_m = hs;
+  if (lr != lastr_.end()) {
+    V3 axis = lr->second * V3{0, 0, 1};
+    for (auto &kv : cells_) {
+      SpotCell &cl = kv.second;
+      if (cl.cam != cam || cl.last < hs_m - 120) continue;
+      if (dot(cl.w, axis) <= -0.2) continue;
+      cl.seq.push_back(0);
+      if (cl.seq.size() > 64) cl.seq.erase(cl.seq.begin());
+    }
+  }
   std::vector<Spot> bl;
   {
     const char *s = line + off;
@@ -2482,6 +2498,13 @@ void Sync::OnLine(double pc, const char *line) {
       if (sscanf(s, " %d %d %d %d%n", &x10, &y10, &npx, &peak, &used) < 4) break;
       s += used;
       bl.push_back({x10, y10, npx, peak});
+      V3 o, d;
+      auto lr2 = lastr_.find(cam);
+      if (lr2 != lastr_.end() && optics_.Ray(cam, x10 / 10.0 - 0.5, y10 / 10.0 - 0.5, o, d)) {
+        V3 W = lr2->second * d;
+        auto it = cells_.find(CellKey(cam, W));
+        if (it != cells_.end() && !it->second.seq.empty()) it->second.seq.back() = 1;
+      }
     }
   }
   nb = (int)bl.size();
@@ -2515,18 +2538,6 @@ uint64_t Sync::CellKey(int cam, const V3 &w) {
   mix((uint64_t)(int64_t)std::lround(w.y * 24));
   mix((uint64_t)(int64_t)std::lround(w.z * 24));
   return h;
-}
-
-// coverage: count this frame for every tracked direction this camera could
-// see (a generous cone around the camera axis; over-counting only makes the
-// measured presence rate conservative, which is the safe direction)
-void Sync::CellsFrame(int cam, const M3 &R, double t) {
-  V3 axis = R * V3{0, 0, 1};
-  for (auto &kv : cells_) {
-    SpotCell &cl = kv.second;
-    if (cl.cam != cam || cl.last < t - 120) continue;
-    if (dot(cl.w, axis) > -0.2) cl.vis++;
-  }
 }
 
 void Sync::CellSeen(int cam, const V3 &w, float peak, double t) {
@@ -2571,7 +2582,7 @@ void Sync::Use(const Shot &f) {
   double w;
   if (!poses_.At(t, R, p) || !poses_.Speed(t, w)) { spots_.other += nb; return; }
   bool still = poses_.Still(t);
-  CellsFrame(cam, R, t);
+  lastr_[cam] = R;
   if (t > cells_next_) { cells_next_ = t + 30; CellsSweep(t); }
   {  // while SteamVR's headset stands still, do the lamps and windows the cameras see stand still too?
     std::vector<std::pair<double, double>> big;
@@ -2608,7 +2619,13 @@ void Sync::Use(const Shot &f) {
       V3 W = R * d;
       CellSeen(cam, W, (float)b.peak, t);
       SpotCell &cl = cells_[CellKey(cam, W)];
-      if (cl.lit) { spots_.cellskip++; continue; }   // always-saturated, never blinks: a lamp or window
+      size_t n = cl.seq.size();
+      if (n >= 24) {
+        int ones = 0;
+        for (uint8_t v : cl.seq) ones += v;
+        double pres = (double)ones / n;
+        if (pres >= 0.92 && cl.amin >= 240) { spots_.cellskip++; continue; }  // always saturated, never blinks: lamp/window
+      }
     }
     bool bright = b.peak >= kBright;
     solver_.Add(t, p + R * o, R * d, hg, cam, bright);  // dim ones too: they tell when the room is too light
