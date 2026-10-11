@@ -1763,7 +1763,7 @@ void Solver::CheckIdentity(double now, const std::vector<std::string> &keys, con
 
 // call ~1 Hz. The solver's clock is the newest sighting: with nothing new seen nothing ages out or is refitted
 StepStat Solver::Step(double /*now*/) {
-  if (manual_acq_ && !has_x_) return StepStat();   // the RANSAC acquirer is retired on the Frame: x is only set by the candidate enumeration (Sync::AcquireFromCandidates); if that cannot earn an unambiguous answer, the system stays unacquired -- held is better than lied to
+  if (manual_acq_ && !has_x_) return StepStat();   // the RANSAC acquirer is retired on the Frame, cold AND re-acquire (see the last_acq_ block below): x is only ever set by the candidate enumeration (Sync::AcquireFromCandidates); if that cannot earn an unambiguous answer, the system stays unacquired -- held is better than lied to
   std::vector<std::string> keys;
   std::vector<V3> S, Z;
   Stations(keys, S, Z);
@@ -1853,7 +1853,11 @@ StepStat Solver::Step(double /*now*/) {
     for (auto &kv : st.per) c.push_back(kv.second);
     locked = Score(c) >= 10;
   }
-  if (now - last_acq_ > (locked ? 10 : 3)) {
+  if (!manual_acq_ && now - last_acq_ > (locked ? 10 : 3)) {
+    // manual_acq_: on the Frame the RANSAC path is retired for re-acquisition too, not just cold
+    // start. Once a lock exists it can only be re-earned through the candidate pipeline
+    // (Sync::AcquireFromCandidates); this block would otherwise be a second, ungated acquirer
+    // quietly Reset()ting x behind the enumeration's back. Quest (manual_acq_ false) keeps stock.
     last_acq_ = now;
     X4 xa;
     int sa, tight;
@@ -3170,96 +3174,25 @@ Sync::MatchReport Sync::MatchLayout(const V3 *P, int n) {
 void Sync::PlaceStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now) {
   std::string other;
   if (!TwoStations(raw, other)) return;
-  {   // SHADOW rollout: the matcher logs its verdict beside the legacy path; flip kMatcherGates
-      // after replaying the light-pin and swap cases. Fixed floors; no covariance tolerance.
-    constexpr bool kMatcherGates = true;   // field-proven 2026-10-11: the override flip-flopped 4.41 -> 4.85 m (forged +-1.2 cm) while SteamVR held 4.92 m
-    std::vector<std::string> keys;
-    std::vector<V3> S, Z, P, Zq;
-    solver_.Stations(keys, S, Z);
-    Solver::Predict(solver_.x(), S, Z, P, Zq);
-    MatchReport mr = MatchLayout(P.data(), (int)P.size());
-    bool legacy_ok = true;   // the legacy path is running: this call reached the override branch
-    std::string sig = Fmt("%d|%d|%.2f|%d", (int)mr.ok, mr.npass, mr.best, (int)legacy_ok);
-    if (sig != match_sig_ || now > match_next_) {
-      match_sig_ = sig;
-      match_next_ = now + 60;
-      if (mr.npass)
-        log_(Fmt("layout match: %d assignment(s) pass, best %.2f m, second %.2f m, margin %.2f m -- %s%s",
-                 mr.npass, mr.best, mr.second, mr.margin, mr.ok ? "accepted" : "AMBIGUOUS",
-                 (!mr.ok && legacy_ok) ? " (legacy override ran anyway: MISMATCH)" : ""));
-      else
-        log_("layout match: no candidate within 0.5 m of the predicted stations -- would reject the override");
-    }
-    if (!mr.ok) return;   // decision rule: ambiguous or nothing passes -> leave x unchanged
-    return;   // the camera-measured baseline override is RETIRED: placement is x and SteamVR's layout, period
-  }  std::map<std::string, Solver::Seen> seen;
-  if (!solver_.Triangulate(seen) || !seen.count(sfile_.anchor) || !seen.count(other)) return;
-  const Solver::Seen &a = seen[sfile_.anchor], &b = seen[other];
-  V3 v = b.q - a.q;
-  double d = std::hypot(v.x, v.z);
-  if (d < 1) return;
-  V3 hv{v.x / d, 0, v.z / d};
-  M3 C;
-  for (int i = 0; i < 3; i++)
-    for (int j = 0; j < 3; j++) C.m[i][j] = a.C.m[i][j] + b.C.m[i][j];
-  double sd_d = std::sqrt(std::max(0.0, dot(hv, C * hv))), sd_h = std::sqrt(std::max(0.0, C.m[1][1]));
-  Rec(now, "I place %s %.4f %.4f %.4f %.4f %d %d", other.c_str(), d, v.y, sd_d, sd_h, a.cells, b.cells);
-  if (a.cells < kPlaceCells || b.cells < kPlaceCells || sd_d > kPlaceSdD || sd_h > kPlaceSdH) return;
-  auto info = [](const PlaceM &p) { return 1 / (p.sd_d * p.sd_d) + 1 / (p.sd_h * p.sd_h); };
-  auto &L = place_sess_[other];
-  PlaceM m{std::min(a.t0, b.t0), now, d, v.y, sd_d, sd_h};
-  if (!L.empty() && m.t0 < L.back().t1) {
-    if (info(m) > info(L.back())) L.back() = m;
-  } else {
-    L.push_back(m);
-  }
-  double wd = 0, wh = 0, md = 0, mh = 0;
-  for (const PlaceM &p : L) {
-    wd += 1 / (p.sd_d * p.sd_d); md += p.d / (p.sd_d * p.sd_d);
-    wh += 1 / (p.sd_h * p.sd_h); mh += p.h / (p.sd_h * p.sd_h);
-  }
-  StationsFile::Place s{md / wd, mh / wh, std::max(kPlaceSessD, 1 / std::sqrt(wd)),
-                        std::max(kPlaceSessH, 1 / std::sqrt(wh))}, use = s;
-  auto pr = place_prior_.find(other);
-  if (pr != place_prior_.end()) {
-    const StationsFile::Place &p = pr->second;
-    double gd = s.d - p.d, gh = s.h - p.h;
-    bool off = (std::fabs(gd) > kPlaceMoved && std::fabs(gd) > 4 * std::hypot(s.sd_d, p.sd_d)) ||
-               (std::fabs(gh) > kPlaceMoved && std::fabs(gh) > 4 * std::hypot(s.sd_h, p.sd_h));
-    int &n = place_off_[other];
-    n = off ? n + 1 : 0;
-    if (n >= 3) {
-      log_(Fmt("base station %s: the cameras see it %+.1f cm further from %s and %+.1f cm higher than measured "
-               "before: it moved; its place is measured again", other.c_str(), gd * 100, sfile_.anchor.c_str(), gh * 100));
-      place_prior_.erase(pr);
-      n = 0;
-    } else if (off) {
-      return;  // the kept place stays until it's clear
-    } else {
-      double pd = 1 / (p.sd_d * p.sd_d), ps = 1 / (s.sd_d * s.sd_d), qd = 1 / (p.sd_h * p.sd_h), qs = 1 / (s.sd_h * s.sd_h);
-      use = {(p.d * pd + s.d * ps) / (pd + ps), (p.h * qd + s.h * qs) / (qd + qs), 1 / std::sqrt(pd + ps),
-             1 / std::sqrt(qd + qs)};
-    }
-  }
-  use.sd_d = std::max(use.sd_d, kPlaceFloor);
-  use.sd_h = std::max(use.sd_h, kPlaceFloor);
-  auto it = sfile_.place.find(other);
-  bool had = it != sfile_.place.end() && it->second.sd_d <= kPlaceSdD && it->second.sd_h <= kPlaceSdH;
-  double moved = it == sfile_.place.end() ? 1 : std::hypot(use.d - it->second.d, use.h - it->second.h);
-  sfile_.place[other] = use;
-  if (!had || moved >= 0.01) {
-    V3 pa, pb;
-    M3 R;
-    frame_.Apply(raw.at(sfile_.anchor).first, raw.at(sfile_.anchor).second, pa, R);
-    frame_.Apply(raw.at(other).first, raw.at(other).second, pb, R);
-    V3 w = pb - pa;
-    log_(Fmt("base station %s: the cameras put it %.3f m from %s and %+.1f cm above it (within %.1f and %.1f cm), "
-             "SteamVR %.3f m and %+.1f cm: the alignment uses the cameras' place", other.c_str(), use.d,
-             sfile_.anchor.c_str(), use.h * 100, use.sd_d * 100, use.sd_h * 100, std::hypot(w.x, w.z), w.y * 100));
-  }
-  if (moved > 0.001 && (!had || now - place_saved_ >= 60)) {
-    place_saved_ = now;
-    sfile_.SaveAuto(Join(cfg_.dir, "stations.json"));
+  // Placement is x and SteamVR's own layout, period: the camera-measured baseline override is
+  // RETIRED. It had flip-flopped 4.41 -> 4.85 m (a forged +-1.2 cm) while SteamVR held 4.92 m:
+  // the baseline is SteamVR's to state, the cameras only ever produce x. What remains here is the
+  // layout matcher's verdict, logged for the evidence watch. Ambiguous or nothing passing leaves
+  // x untouched -- there is no second placement path, and no code models a station moving.
+  std::vector<std::string> keys;
+  std::vector<V3> S, Z, P, Zq;
+  solver_.Stations(keys, S, Z);
+  Solver::Predict(solver_.x(), S, Z, P, Zq);
+  MatchReport mr = MatchLayout(P.data(), (int)P.size());
+  std::string sig = Fmt("%d|%d|%.2f", (int)mr.ok, mr.npass, mr.best);
+  if (sig != match_sig_ || now > match_next_) {
+    match_sig_ = sig;
+    match_next_ = now + 60;
+    if (mr.npass)
+      log_(Fmt("layout match: %d assignment(s) pass, best %.2f m, second %.2f m, margin %.2f m -- %s",
+               mr.npass, mr.best, mr.second, mr.margin, mr.ok ? "accepted" : "AMBIGUOUS"));
+    else
+      log_("layout match: no candidate within 0.5 m of the predicted stations -- holding the current x");
   }
 }
 

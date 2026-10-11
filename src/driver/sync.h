@@ -296,7 +296,7 @@ class Solver {
   StepStat Step(double now);
   bool has_x() const { return has_x_; }
   X4 x() const { return x_; }   // valid only when has_x(); the layout matcher reads it
-  void SetManualAcq(bool m) { manual_acq_ = m; }   // Frame: x is only ever set by the candidate enumeration; the RANSAC path is retired
+  void SetManualAcq(bool m) { manual_acq_ = m; }   // Frame: x is only ever set by the candidate enumeration; the RANSAC path (cold and re-acquire) is retired
   void SetLockTime(double t) { x_since_ = t; }     // bounds settle for the first seconds after a lock is earned
   bool manual_acq_ = false;
   double x_since_ = -1e9;
