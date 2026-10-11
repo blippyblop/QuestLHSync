@@ -104,7 +104,7 @@ constexpr double kIdEvery = 10.0, kSwapGain = 0.10, kSwapFit = 0.7;
 constexpr double kBodyNear = 1.0, kBodyGap = 1.0;  // m
 // ... or their motion does (Sync::BodyMotion): when the head went kBodyMoved, and they follow it one way by kBodyCorr
 // and the other way not (a fit and its mirror move them opposite ways)
-constexpr double kBodyMoved = 2.0, kBodyCorr = 0.2;  // m, correlation
+constexpr double kBodyMoved = 2.0, kBodyCorr = 0.35;  // m, correlation -- the witness only speaks on a clear follow-the-head (measured +-0.24 must not decide a mirror)
 
 double RotorPeriod(int channel);  // s, a 2.0 base station on channel 1..16, else 0
 
@@ -313,6 +313,8 @@ class Solver {
   double x_since_ = -1e9;
   int sat_count_ = 0;
   int ScoreX(const X4 &x, double gate);   // rays within gate (DEGREES) of any predicted station direction (acquisition enumeration)
+  // witness: do the lighthouse devices worn or held favour a or b? 1 a, 2 b, 0 no evidence (the enumeration's mirror test)
+  int WitnessFavours(const X4 &a, const X4 &b, double &da, double &db, std::string &how) const { return BodyFavours(a, b, da, db, how); }
   bool starved() const { return starved_; }
   int resets() const { return resets_; }  // stations (sorted by serial) as the solver uses them
   void Stations(std::vector<std::string> &keys, std::vector<V3> &S, std::vector<V3> &Z) const;

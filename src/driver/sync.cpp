@@ -2930,7 +2930,10 @@ void Sync::AcquireFromCandidates(double t) {
       // chance, and with the RANSAC acquirer retired nothing could ever lock. The gate is 1 deg.
       X4 x = YawFit({S[0], S[1]}, {cands_[i].q, cands_[j].q});
       int sc = solver_.ScoreX(x, 1.0);
-      double w = sc * (1.0 + 0.25 * std::min(cands_[i].beat, cands_[j].beat));
+      // the beat only BREAKS NEAR-TIES. As a multiplicative weight (sc * (1 + 0.25*beat)) it let a
+      // high-beat pair win over one with more support, while the runner-up stayed raw -- so the
+      // runner-up came out ABOVE the best (measured: 928 vs 1031) and nothing could ever accept.
+      double w = sc + 0.05 * std::min(cands_[i].beat, cands_[j].beat);
       if (w > bw) { bw = w; bsc = sc; bi = i; bj = j; }
     }
   }
@@ -2939,8 +2942,10 @@ void Sync::AcquireFromCandidates(double t) {
   // x; scored against the best they read as a nearly-equal second solution and the enumeration
   // holds forever (measured: 455 vs 326, same two stations both ways). Ambiguity is about distinct
   // x, not distinct pairs, so a pair within kSameX of the best is the same answer, not a rival.
+  X4 xb{}, xr{};
+  int ri = -1, rj = -1;
   if (bi >= 0) {
-    X4 xb = YawFit({S[0], S[1]}, {cands_[bi].q, cands_[bj].q});
+    xb = YawFit({S[0], S[1]}, {cands_[bi].q, cands_[bj].q});
     const double kSameX = 1.0;   // m: two fits predicting the stations within this are one solution
     for (int i = 0; i < (int)cands_.size(); i++) {
       for (int j = 0; j < (int)cands_.size(); j++) {
@@ -2950,21 +2955,47 @@ void Sync::AcquireFromCandidates(double t) {
         X4 x = YawFit({S[0], S[1]}, {cands_[i].q, cands_[j].q});
         if (Apart(x, xb, S) <= kSameX) continue;
         int sc = solver_.ScoreX(x, 1.0);
-        if (sc > ssc) ssc = sc;
+        if (sc > ssc) { ssc = sc; ri = i; rj = j; xr = x; }
       }
+    }
+  }
+  // Two stations facing each other fit as well turned 180 deg about their midpoint (a mirror), and
+  // rays alone cannot tell them apart -- the mirror put every other lighthouse device across the
+  // room. The devices the user wears or holds stay near the head, so they decide: the same witness
+  // Solver::CheckMirror used, now inside the candidate pipeline. No witness -> hold, never guess.
+  bool accept = false;
+  int wi = -1, wj = -1, wsc = bsc;
+  X4 x{};
+  std::string why;
+  if (bi >= 0 && bsc >= 20) {
+    if (ssc == 0 || ssc < 20 || bsc >= 2 * ssc) {
+      accept = true; wi = bi; wj = bj; x = xb; wsc = bsc;
+    } else if (ri >= 0) {
+      // Two real solutions -- the mirror case. The worn or held devices CAN CONFIRM the best, but a
+      // marginal reading must never INSTALL the runner-up: a +-0.2 motion reading once did, and the
+      // fit held one station and lost the other (then looped through re-earn). Confirm, never override.
+      double da, db;
+      std::string how;
+      int fav = solver_.WitnessFavours(xb, xr, da, db, how);
+      if (fav == 1) { accept = true; wi = bi; wj = bj; x = xb; wsc = bsc; why = how; }
+      else if (fav == 2) why = Fmt("the worn or held devices favour the rival (%s) -- holding rather than install the runner-up", how.c_str());
+      else why = "two real solutions, no witness";
     }
   }
   if (t > cand_log_) {   // shares the 60 s evidence-watch throttle
     cand_log_ = t + 60;
-    log_(Fmt("acquisition: %d candidate pairs scored, best support %d (runner-up %d)%s", bi < 0 ? 0 : (int)cands_.size() * ((int)cands_.size() - 1), bsc, ssc,
-             bi >= 0 && bsc >= 20 && (ssc == 0 || bsc >= 2 * ssc) ? "" : " -- ambiguous or unsupported: holding"));
+    std::string s2 = ri >= 0 ? Fmt(" [rival %d at yaw %+.1f, apart %.1f m]", ssc, xr[0] * kDeg, Apart(xr, xb, S)) : std::string();
+    log_(Fmt("acquisition: %d candidate pairs scored, best support %d/%.1f deg%s%s", bi < 0 ? 0 : (int)cands_.size() * ((int)cands_.size() - 1),
+             bsc, xb[0] * kDeg, s2.c_str(),
+             accept ? Fmt(" -- accepted%s", why.empty() ? "" : Fmt(" (%s)", why.c_str()).c_str()).c_str()
+                    : " -- ambiguous or unsupported: holding"));
   }
-  if (bi < 0 || bsc < 20 || (ssc > 0 && bsc < 2 * ssc)) return;
-  X4 x = YawFit({S[0], S[1]}, {cands_[bi].q, cands_[bj].q});
+  if (!accept) return;
   solver_.Reset(x);
   solver_.SetLockTime(t);
-  log_(Fmt("acquired by enumeration: candidates %d,%d support %d (runner-up %d, beats %.2f/%.2f) yaw %+.2f deg t [%.2f %.2f %.2f]",
-           bi, bj, bsc, ssc, cands_[bi].beat, cands_[bj].beat, x[0] * 180 / kPi, x[1], x[2], x[3]));
+  log_(Fmt("acquired by enumeration: candidates %d,%d support %d (rival %d, beats %.2f/%.2f) yaw %+.2f deg t [%.2f %.2f %.2f]%s",
+           wi, wj, wsc, ssc, cands_[wi].beat, cands_[wj].beat, x[0] * 180 / kPi, x[1], x[2], x[3],
+           why.empty() ? "" : Fmt(" (%s)", why.c_str()).c_str()));
 }
 
 void Sync::MatchSweep(double t) {
