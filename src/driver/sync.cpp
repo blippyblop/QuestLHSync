@@ -2624,6 +2624,28 @@ void Sync::CellSeen(int cam, const V3 &w, float peak, double t) {
 // laser dot's dropouts keep its rate at ~0.7-0.8, well below the line -- and
 // in a dim room its presence can peg anyway, so this only NAMES steady
 // directions for the log; the short-frame gate below does the skipping.
+// rotor-beat prominence over a candidate's presence ring (Goertzel, ~0.5-13 Hz): a station's
+// in-view long-frame presence oscillates rotor-locked, a lamp's is flat, a glint's stochastic.
+// EVIDENCE ACCUMULATION: the score sharpens as the ring grows. A score, not a gate (yet).
+static double BeatScore(const std::vector<uint8_t> &ring, double fs) {
+  int n = (int)ring.size();
+  if (n < 32) return 0;
+  double mean = 0;
+  for (uint8_t v : ring) mean += v;
+  mean /= n;
+  static double win[64];
+  for (int i = 0; i < n; i++) win[i] = (ring[i] - mean) * (0.5 - 0.5 * std::cos(2 * 3.14159265358979 * i / (n - 1)));
+  double best = 0, sum = 0;
+  for (int k = 0; k < 24; k++) {
+    double f = (0.5 + 0.55 * k) / fs;
+    double coef = 2 * std::cos(2 * 3.14159265358979 * f), s0 = 0, s1 = 0, s2 = 0;
+    for (int i = 0; i < n; i++) { s0 = win[i] + coef * s1 - s2; s2 = s1; s1 = s0; }
+    double m = std::sqrt(std::max(0.0, s0 * s0 + s1 * s1 - coef * s0 * s1));
+    sum += m;
+    if (m > best) best = m;
+  }
+  return sum > 0 ? best / (sum / 24) : 0;
+}
 static double PointResidual(const V3 *O, const V3 *D, int n, V3 *qout = nullptr) {
   auto fit = [&](const int *idx, int k, double out[3]) {
     double m[9] = {0}, v[3] = {0};
@@ -2676,6 +2698,7 @@ static double PointResidual(const V3 *O, const V3 *D, int n, V3 *qout = nullptr)
 void Sync::CellsSweep(double t) {
   long lit = 0, watched = 0; double best_rate = 0; long best_seen = 0, best_vis = 0;
   cands_.clear();   // rebuilt every sweep: the layout matcher reads this snapshot
+  std::vector<Cand> raw;
   for (int cam = 0; cam < 4; cam++) actk_[cam].clear();
   for (auto it = cells_.begin(); it != cells_.end();) {
     SpotCell &cl = it->second;
@@ -2710,7 +2733,7 @@ void Sync::CellsSweep(double t) {
       }
     }
     if (!cl.fuzzy && cl.nO >= 6 && cl.seen >= 20 && t - cl.last < 10)
-      cands_.push_back({cl.q3, cl.res3d, cl.seen, it->first});
+      raw.push_back({cl.q3, cl.res3d, cl.seen, it->first, (float)BeatScore(cl.seqL, 33.0), {it->first}});
     if (cl.vis >= 60 && cl.seen >= 16) {      watched++;
       double rate = (double)cl.seen / cl.vis;
       // lifetime peaks: a lamp's sightings saturate and stay saturated; a dot
@@ -2727,6 +2750,24 @@ void Sync::CellsSweep(double t) {
       if (cl.lit) lit++;
     }
     ++it;
+  }
+  // merge starburst fragments: one source must be ONE candidate. Arms sit within ~0.6 m of the
+  // core at room range and flicker with it, so position proximity + greedy core-first merge
+  // collapses them; the merged candidate carries every member key (all arms gate together) and
+  // the best member's beat score.
+  std::sort(raw.begin(), raw.end(), [](const Cand &a, const Cand &b) { return a.seen > b.seen; });
+  for (const Cand &c : raw) {
+    bool merged = false;
+    for (Cand &m : cands_) {
+      if (norm(m.q - c.q) <= 0.6) {
+        m.keys.push_back(c.keys[0]);
+        if (c.beat > m.beat) m.beat = c.beat;
+        if (c.seen > m.seen) m.seen = c.seen;
+        merged = true;
+        break;
+      }
+    }
+    if (!merged) cands_.push_back(c);
   }
   if (watched > 0 && best_seen > 0)
     log_(Fmt("cameras: %ld presence checks, highest %.0f%% (%ld/%ld), %ld judged steady -- a real station sits near 70-85%%",
@@ -2757,6 +2798,14 @@ void Sync::MatchSweep(double t) {
   } else if (++match_fail_ == 3) {
     log_("layout match: 3 sweeps without an accepted correspondence -- the fit is not on the stations, re-acquiring");
     solver_.PoseBreak(t);
+  }
+  if (t > cand_log_) {   // evidence watch: per-candidate beat prominence, the lighthouse-vs-light signal
+    cand_log_ = t + 60;
+    std::string s;
+    for (size_t i = 0; i < cands_.size() && i < 6; i++)
+      s += Fmt("  q[%.1f %.1f %.1f] beat %.2f seen %ld%s", cands_[i].q.x, cands_[i].q.y, cands_[i].q.z,
+               cands_[i].beat, cands_[i].seen, cands_[i].keys.size() > 1 ? Fmt(" (%d arms)", (int)cands_[i].keys.size() - 1).c_str() : "");
+    log_(Fmt("candidates: %zu.%s", cands_.size(), s.c_str()));
   }
 }
 

@@ -470,7 +470,7 @@ class Sync {
   // layout matcher (shadow rollout): candidates from the 3D cell layer vs the predicted slam-space
   // station positions x^-1(S_k). Fixed tolerance floors only -- the forged +-1.4 cm covariance event
   // showed C cannot be trusted as a tolerance.
-  struct Cand { V3 q; float res; long seen; uint64_t key; };
+  struct Cand { V3 q; float res; long seen; uint64_t key; float beat = 0; std::vector<uint64_t> keys; };
   std::vector<Cand> cands_;   // rebuilt every CellsSweep
   struct MatchReport { bool ok = false; int npass = 0, a0 = 0, a1 = 0; double best = 0, second = 0, margin = 0; };
   MatchReport MatchLayout(const V3 *P, int n);
@@ -479,6 +479,7 @@ class Sync {
   std::string match_sig_;
   double match_next_ = 0;
   int match_fail_ = 0;
+  double cand_log_ = 0;
   static uint64_t CellKey(int cam, const V3 &w);
   void CellsFrame(int cam, const M3 &R, double t);
   void CellSeen(int cam, const V3 &w, float peak, double t);
