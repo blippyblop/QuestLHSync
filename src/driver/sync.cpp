@@ -2624,7 +2624,7 @@ void Sync::CellSeen(int cam, const V3 &w, float peak, double t) {
 // laser dot's dropouts keep its rate at ~0.7-0.8, well below the line -- and
 // in a dim room its presence can peg anyway, so this only NAMES steady
 // directions for the log; the short-frame gate below does the skipping.
-static double PointResidual(const V3 *O, const V3 *D, int n) {
+static double PointResidual(const V3 *O, const V3 *D, int n, V3 *qout = nullptr) {
   auto fit = [&](const int *idx, int k, double out[3]) {
     double m[9] = {0}, v[3] = {0};
     for (int i = 0; i < k; i++) {
@@ -2660,21 +2660,22 @@ static double PointResidual(const V3 *O, const V3 *D, int n) {
   double lim = sorted[n - 1 - n / 4];   // drop the worst quarter once: one outlier-resistant pass
   for (int i = 0; i < n; i++) if (res[i] <= lim && kn < 16) keep[kn++] = i;
   if (kn >= 4 && fit(keep, kn, p)) {
-    double s = 0;
-    for (int i = 0; i < kn; i++) {
+    double s = 0;    for (int i = 0; i < kn; i++) {
       double wx = p[0] - O[keep[i]].x, wy = p[1] - O[keep[i]].y, wz = p[2] - O[keep[i]].z;
       double d[3] = {D[keep[i]].x, D[keep[i]].y, D[keep[i]].z};
       double along = wx*d[0] + wy*d[1] + wz*d[2];
       s += std::max(0.0, wx*wx + wy*wy + wz*wz - along*along);
     }
+    if (qout) *qout = V3{(float)p[0], (float)p[1], (float)p[2]};
     return std::sqrt(s / kn);
   }
-  double s = 0;
-  for (int i = 0; i < n; i++) s += res[i] * res[i];
+  double s = 0;  for (int i = 0; i < n; i++) s += res[i] * res[i];
   return std::sqrt(s / n);
 }
 
-void Sync::CellsSweep(double t) {  long lit = 0, watched = 0; double best_rate = 0; long best_seen = 0, best_vis = 0;
+void Sync::CellsSweep(double t) {
+  long lit = 0, watched = 0; double best_rate = 0; long best_seen = 0, best_vis = 0;
+  cands_.clear();   // rebuilt every sweep: the layout matcher reads this snapshot
   for (int cam = 0; cam < 4; cam++) actk_[cam].clear();
   for (auto it = cells_.begin(); it != cells_.end();) {
     SpotCell &cl = it->second;
@@ -2703,12 +2704,13 @@ void Sync::CellsSweep(double t) {  long lit = 0, watched = 0; double best_rate =
       double spread = 0;
       for (int i = 0; i < cl.nO; i++) spread = std::max(spread, norm(cl.sO[i] - c));
       if (spread >= 0.25) {
-        cl.res3d = (float)PointResidual(cl.sO, cl.sD, cl.nO);
+        cl.res3d = (float)PointResidual(cl.sO, cl.sD, cl.nO, &cl.q3);
         cl.fuzzy = cl.res3d > 0.08;   // a station aperture stays cm-tight; glow, edges and big lamps smear
       }
     }
-    if (cl.vis >= 60 && cl.seen >= 16) {
-      watched++;
+    if (!cl.fuzzy && cl.nO >= 6 && cl.seen >= 20 && t - cl.last < 10)
+      cands_.push_back({cl.q3, cl.res3d, cl.seen});
+    if (cl.vis >= 60 && cl.seen >= 16) {      watched++;
       double rate = (double)cl.seen / cl.vis;
       // lifetime peaks: a lamp's sightings saturate and stay saturated; a dot
       // dipping through beat nulls swings (and, in a dim room, its long-frame
@@ -2962,9 +2964,69 @@ bool Sync::TwoStations(const std::map<std::string, std::pair<V3, M3>> &raw, std:
 // The other station of an automatic two-station frame where the cameras see it from the anchor (Tick hands it to the
 // solver): this session's measurements (of windows that overlap, the better), with what earlier sessions kept unless
 // three in a row say the station moved
+// The layout matcher: candidates from the 3D cell layer vs the predicted slam-space station
+// positions x^-1(S_k). Enumerates assignments (n <= 4), gates each candidate pair at a FIXED
+// 0.5 m (floors, not covariance -- the forged +-1.4 cm event), scores by total residual, and
+// accepts only an unambiguous winner (single survivor, or margin >= 0.25 m over the runner-up).
+Sync::MatchReport Sync::MatchLayout(const V3 *P, int n) {
+  MatchReport mr;
+  if (n < 2 || n > 4 || (int)cands_.size() < n) return mr;
+  const double kTol = 0.5, kMargin = 0.25;
+  std::vector<int> perm(n);
+  for (int i = 0; i < n; i++) perm[i] = i;
+  int best[4] = {-1, -1, -1, -1};
+  double bs = 1e9, sb = 1e9;
+  do {
+    double s = 0;
+    bool ok = true;
+    for (int k = 0; k < n && ok; k++) {
+      double e = norm(cands_[perm[k]].q - P[k]);
+      if (e > kTol) { ok = false; break; }
+      s += e;
+    }
+    if (!ok) continue;
+    mr.npass++;
+    if (s < bs) {
+      sb = bs; bs = s;
+      for (int k = 0; k < n; k++) best[k] = perm[k];
+    } else if (s < sb) {
+      sb = s;
+    }
+  } while (std::next_permutation(perm.begin(), perm.end()));
+  mr.best = mr.npass ? bs : -1;
+  mr.second = mr.npass > 1 ? sb : 0;
+  mr.a0 = best[0];
+  mr.a1 = best[1];
+  mr.ok = mr.npass >= 1 && (mr.npass == 1 || sb - bs >= kMargin);
+  match_ok_ = mr.ok;
+  return mr;
+}
+
 void Sync::PlaceStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now) {
   std::string other;
   if (!TwoStations(raw, other)) return;
+  {   // SHADOW rollout: the matcher logs its verdict beside the legacy path; flip kMatcherGates
+      // after replaying the light-pin and swap cases. Fixed floors; no covariance tolerance.
+    constexpr bool kMatcherGates = false;
+    std::vector<std::string> keys;
+    std::vector<V3> S, Z, P, Zq;
+    solver_.Stations(keys, S, Z);
+    Solver::Predict(solver_.x(), S, Z, P, Zq);
+    MatchReport mr = MatchLayout(P.data(), (int)P.size());
+    bool legacy_ok = true;   // the legacy path is running: this call reached the override branch
+    std::string sig = Fmt("%d|%d|%.2f|%d", (int)mr.ok, mr.npass, mr.best, (int)legacy_ok);
+    if (sig != match_sig_ || now > match_next_) {
+      match_sig_ = sig;
+      match_next_ = now + 60;
+      if (mr.npass)
+        log_(Fmt("layout match: %d assignment(s) pass, best %.2f m, second %.2f m, margin %.2f m -- %s%s",
+                 mr.npass, mr.best, mr.second, mr.margin, mr.ok ? "accepted" : "AMBIGUOUS",
+                 (!mr.ok && legacy_ok) ? " (legacy override ran anyway: MISMATCH)" : ""));
+      else
+        log_("layout match: no candidate within 0.5 m of the predicted stations -- would reject the override");
+    }
+    if (kMatcherGates && !mr.ok) return;   // decision rule: ambiguous or nothing passes -> leave x unchanged
+  }
   std::map<std::string, Solver::Seen> seen;
   if (!solver_.Triangulate(seen) || !seen.count(sfile_.anchor) || !seen.count(other)) return;
   const Solver::Seen &a = seen[sfile_.anchor], &b = seen[other];
@@ -3041,6 +3103,7 @@ void Sync::LevelCheck(double now) {
   std::vector<V3> S, Z;
   solver_.Stations(keys, S, Z);
   if (S.size() != 2) return;  // with three, LevelStep levels the frame by the cameras themselves
+  if (!match_ok_) return;     // levelling waits for an unambiguous layout match: a decoy cluster must not tilt the frame
   // a measured station stays where the cameras put it, gravity's levelling or not: they'd only check themselves
   if (solver_.measured(keys[0]) || solver_.measured(keys[1])) return;
   V3 b = S[1] - S[0];

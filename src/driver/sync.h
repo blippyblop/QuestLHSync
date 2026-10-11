@@ -295,10 +295,9 @@ class Solver {
   void PoseBreak(double t);
   StepStat Step(double now);
   bool has_x() const { return has_x_; }
+  X4 x() const { return x_; }   // valid only when has_x(); the layout matcher reads it
   bool starved() const { return starved_; }
-  int resets() const { return resets_; }
-  X4 x() const { return x_; }
-  // stations (sorted by serial) as the solver uses them
+  int resets() const { return resets_; }  // stations (sorted by serial) as the solver uses them
   void Stations(std::vector<std::string> &keys, std::vector<V3> &S, std::vector<V3> &Z) const;
   bool measured(const std::string &serial) const { return fix_.count(serial) && !stale_.count(serial); }
   // a measured place from now on (Sync's automatic two-station frames: it follows SteamVR's), or none
@@ -462,12 +461,22 @@ class Sync {
   struct SpotCell { int cam = 0; V3 w; long seen = 0, vis = 0; float amax = 0, amin = 1e9f; double last = 0; bool lit = false; bool inact = false;
                    std::vector<uint8_t> seqL; std::vector<uint8_t> seqS;  // per-class presence rings: 1 = dot this frame, 0 = in view, none
                    V3 sO[12]; V3 sD[12]; V3 lastO; short nO = 0, slot_ = 0;  // ray samples spread across head travel (3D point test)
-                   float res3d = 0; bool fuzzy = false; };  // RMS residual of the 3D point fit; fuzzy = glow/edge, not an emitter
+                   float res3d = 0; bool fuzzy = false; V3 q3; };  // RMS residual of the 3D point fit; fuzzy = glow/edge, not an emitter
   std::map<uint64_t, SpotCell> cells_;
   std::vector<uint64_t> actk_[4];   // per camera: keys of recently-active cells (the only ones the per-line marking touches)
   std::map<int, M3> lastr_;          // per camera: last known pose (presence marking)
   double cells_next_ = 0;
   long cells_dropped_ = 0;
+  // layout matcher (shadow rollout): candidates from the 3D cell layer vs the predicted slam-space
+  // station positions x^-1(S_k). Fixed tolerance floors only -- the forged +-1.4 cm covariance event
+  // showed C cannot be trusted as a tolerance.
+  struct Cand { V3 q; float res; long seen; };
+  std::vector<Cand> cands_;   // rebuilt every CellsSweep
+  struct MatchReport { bool ok = false; int npass = 0, a0 = 0, a1 = 0; double best = 0, second = 0, margin = 0; };
+  MatchReport MatchLayout(const V3 *P, int n);
+  bool match_ok_ = false, match_logged_ = false;
+  std::string match_sig_;
+  double match_next_ = 0;
   static uint64_t CellKey(int cam, const V3 &w);
   void CellsFrame(int cam, const M3 &R, double t);
   void CellSeen(int cam, const V3 &w, float peak, double t);
