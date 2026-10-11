@@ -453,14 +453,16 @@ class Sync {
   };
   Status GetStatus(double now);
   // the cameras' bright spots so far, and what became of them
-  struct Spots { long frames = 0, seen = 0, used = 0, still = 0, fast = 0, big = 0, other = 0, dim = 0, cellskip = 0, sframe = 0; };
+  struct Spots { long frames = 0, seen = 0, used = 0, still = 0, fast = 0, big = 0, other = 0, dim = 0, cellskip = 0, sframe = 0, fuzz = 0; };
   Spots spots() { std::lock_guard<std::mutex> g(net_); return spots_; }
   // per-world-direction dot history (PC-side presence check): a laser dot is
   // present in ~0.7-0.8 of the frames its direction was in view (the rotor
   // sweeps miss the exposure window at the beat period); a lamp or window is
   // ~1.0 and always saturated. Measured first, gated conservatively.
   struct SpotCell { int cam = 0; V3 w; long seen = 0, vis = 0; float amax = 0, amin = 1e9f; double last = 0; bool lit = false; bool inact = false;
-                   std::vector<uint8_t> seqL; std::vector<uint8_t> seqS; };  // per-class presence rings: 1 = dot this frame, 0 = in view, none
+                   std::vector<uint8_t> seqL; std::vector<uint8_t> seqS;  // per-class presence rings: 1 = dot this frame, 0 = in view, none
+                   V3 sO[12]; V3 sD[12]; V3 lastO; short nO = 0, slot_ = 0;  // ray samples spread across head travel (3D point test)
+                   float res3d = 0; bool fuzzy = false; };  // RMS residual of the 3D point fit; fuzzy = glow/edge, not an emitter
   std::map<uint64_t, SpotCell> cells_;
   std::vector<uint64_t> actk_[4];   // per camera: keys of recently-active cells (the only ones the per-line marking touches)
   std::map<int, M3> lastr_;          // per camera: last known pose (presence marking)

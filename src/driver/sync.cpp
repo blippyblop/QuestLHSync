@@ -2624,9 +2624,57 @@ void Sync::CellSeen(int cam, const V3 &w, float peak, double t) {
 // laser dot's dropouts keep its rate at ~0.7-0.8, well below the line -- and
 // in a dim room its presence can peg anyway, so this only NAMES steady
 // directions for the log; the short-frame gate below does the skipping.
+static double PointResidual(const V3 *O, const V3 *D, int n) {
+  auto fit = [&](const int *idx, int k, double out[3]) {
+    double m[9] = {0}, v[3] = {0};
+    for (int i = 0; i < k; i++) {
+      double o[3] = {O[idx[i]].x, O[idx[i]].y, O[idx[i]].z};
+      double d[3] = {D[idx[i]].x, D[idx[i]].y, D[idx[i]].z};
+      double doto = d[0]*o[0] + d[1]*o[1] + d[2]*o[2];
+      for (int r = 0; r < 3; r++) {
+        for (int c = 0; c < 3; c++) m[r*3+c] += (r == c) - d[r]*d[c];
+        v[r] += o[r] - d[r]*doto;
+      }
+    }
+    double cf[9];
+    cf[0] =  m[4]*m[8] - m[5]*m[7];  cf[1] = -m[3]*m[8] + m[5]*m[6];  cf[2] =  m[3]*m[7] - m[4]*m[6];
+    cf[3] = -m[1]*m[8] + m[2]*m[7];  cf[4] =  m[0]*m[8] - m[2]*m[6];  cf[5] = -m[0]*m[7] + m[1]*m[6];
+    cf[6] =  m[1]*m[5] - m[2]*m[4];  cf[7] = -m[0]*m[5] + m[2]*m[3];  cf[8] =  m[0]*m[4] - m[1]*m[3];
+    double det = m[0]*cf[0] + m[1]*cf[1] + m[2]*cf[2];
+    if (std::fabs(det) < 1e-12) return false;
+    for (int r = 0; r < 3; r++) out[r] = (cf[r*3]*v[0] + cf[r*3+1]*v[1] + cf[r*3+2]*v[2]) / det;
+    return true;
+  };
+  int idx[16], keep[16], kn = 0;
+  for (int i = 0; i < n; i++) idx[i] = i;
+  double p[3];
+  if (!fit(idx, n, p)) return 1e9f;
+  double res[16], sorted[16];
+  for (int i = 0; i < n; i++) {
+    double wx = p[0] - O[i].x, wy = p[1] - O[i].y, wz = p[2] - O[i].z;
+    double d[3] = {D[i].x, D[i].y, D[i].z};
+    double along = wx*d[0] + wy*d[1] + wz*d[2];
+    sorted[i] = res[i] = std::sqrt(std::max(0.0, wx*wx + wy*wy + wz*wz - along*along));
+  }
+  std::sort(sorted, sorted + n);
+  double lim = sorted[n - 1 - n / 4];   // drop the worst quarter once: one outlier-resistant pass
+  for (int i = 0; i < n; i++) if (res[i] <= lim && kn < 16) keep[kn++] = i;
+  if (kn >= 4 && fit(keep, kn, p)) {
+    double s = 0;
+    for (int i = 0; i < kn; i++) {
+      double wx = p[0] - O[keep[i]].x, wy = p[1] - O[keep[i]].y, wz = p[2] - O[keep[i]].z;
+      double d[3] = {D[keep[i]].x, D[keep[i]].y, D[keep[i]].z};
+      double along = wx*d[0] + wy*d[1] + wz*d[2];
+      s += std::max(0.0, wx*wx + wy*wy + wz*wz - along*along);
+    }
+    return std::sqrt(s / kn);
+  }
+  double s = 0;
+  for (int i = 0; i < n; i++) s += res[i] * res[i];
+  return std::sqrt(s / n);
+}
 
-void Sync::CellsSweep(double t) {
-  long lit = 0, watched = 0; double best_rate = 0; long best_seen = 0, best_vis = 0;
+void Sync::CellsSweep(double t) {  long lit = 0, watched = 0; double best_rate = 0; long best_seen = 0, best_vis = 0;
   for (int cam = 0; cam < 4; cam++) actk_[cam].clear();
   for (auto it = cells_.begin(); it != cells_.end();) {
     SpotCell &cl = it->second;
@@ -2648,6 +2696,17 @@ void Sync::CellsSweep(double t) {
   for (auto it = cells_.begin(); it != cells_.end();) {
     SpotCell &cl = it->second;
     if (cl.last < t - 120) { it = cells_.erase(it); continue; }
+    if (cl.nO >= 6) {   // enough travel-spread samples: does this direction converge on ONE 3D point?
+      V3 c{0, 0, 0};
+      for (int i = 0; i < cl.nO; i++) c = c + cl.sO[i];
+      c = c * (1.0f / cl.nO);
+      double spread = 0;
+      for (int i = 0; i < cl.nO; i++) spread = std::max(spread, norm(cl.sO[i] - c));
+      if (spread >= 0.25) {
+        cl.res3d = (float)PointResidual(cl.sO, cl.sD, cl.nO);
+        cl.fuzzy = cl.res3d > 0.08;   // a station aperture stays cm-tight; glow, edges and big lamps smear
+      }
+    }
     if (cl.vis >= 60 && cl.seen >= 16) {
       watched++;
       double rate = (double)cl.seen / cl.vis;
@@ -2717,6 +2776,16 @@ void Sync::Use(const Shot &f) {
     if (optics_.exact_time()) {  // Steam Frame only; Quest keeps stock behavior
       V3 W = R * d;
       CellSeen(cam, W, (float)b.peak, t);      SpotCell &cl = cells_[CellKey(cam, W)];
+      {   // spread ray samples across head travel for the 3D point test (fuzzy gate below, computed in CellsSweep)
+        V3 O = p + R * o;
+        double dx = O.x - cl.lastO.x, dy = O.y - cl.lastO.y, dz = O.z - cl.lastO.z;
+        if (cl.nO == 0 || dx*dx + dy*dy + dz*dz >= 0.0036) {
+          cl.lastO = O;
+          int s = cl.nO < 12 ? cl.nO++ : (cl.slot_++ % 12);
+          cl.sO[s] = O;
+          cl.sD[s] = R * d;
+        }
+      }
       // PRIMARY filter: short-frame presence. The lighthouse's sweeps are
       // microsecond-wide and unsynced with the S exposure, so a real dot is
       // ~absent from S frames (measured 0.00 over thousands of frames). A
@@ -2739,6 +2808,7 @@ void Sync::Use(const Shot &f) {
         double ps = (double)os / ns;
         if (ps >= 0.15) { spots_.cellskip++; continue; }
       }
+      if (cl.fuzzy) { spots_.fuzz++; continue; }   // the direction's rays do not converge on one 3D point: glow, an edge, a lamp face
     }
     if (have_lag && cfg_.learn_timing) timing_.Record(grid_pc, o, d, hg, cam, b.peak >= kBright);  // gated rays only on the Frame: lamps must not steer exposure learning; fast turns still feed it (Quest stock order)
     if (w > kWmax) { spots_.fast++; continue; }
@@ -2760,7 +2830,7 @@ std::string Sync::Describe(const Spots &a, const Spots &b) {
   part(b.other - a.other, "without a headset pose");
   part(b.dim - a.dim, "dim, kept for a room too light for the dots to saturate");
   part(b.cellskip - a.cellskip, "directions also lit on short frames (lamps, steady IR)");
-  part(b.sframe - a.sframe, "short-frame evidence dots");
+  part(b.fuzz - a.fuzz, "directions that fail the 3D point test (glow, edges)");  part(b.sframe - a.sframe, "short-frame evidence dots");
   return Fmt("%ld bright spots, %ld used", n, b.used - a.used) + (why.empty() ? "" : " (" + why + ")");
 }
 
