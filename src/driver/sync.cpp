@@ -2758,15 +2758,17 @@ void Sync::CellsSweep(double t) {
     }
     ++it;
   }
-  // merge starburst fragments: one source must be ONE candidate. Arms sit within ~0.6 m of the
-  // core at room range and flicker with it, so position proximity + greedy core-first merge
-  // collapses them; the merged candidate carries every member key (all arms gate together) and
-  // the best member's beat score.
+  // merge starburst fragments: one source must be ONE candidate. Arms sit within ~0.3 m of the
+  // core at room range (1.5-3 deg) and flicker with it, so position proximity + greedy core-first
+  // merge collapses them; the merged candidate carries every member key (all arms gate together)
+  // and the best member's beat score. Floor note: a real station ~0.5 m from a lamp must NOT
+  // merge with it (the lamp's S-verdict would kill the station), so the radius stays under that.
+  const double kMergeR = 0.3;
   std::sort(raw.begin(), raw.end(), [](const Cand &a, const Cand &b) { return a.seen > b.seen; });
   for (const Cand &c : raw) {
     bool merged = false;
     for (Cand &m : cands_) {
-      if (norm(m.q - c.q) <= 0.6) {
+      if (norm(m.q - c.q) <= kMergeR) {
         m.keys.push_back(c.keys[0]);
         if (c.beat > m.beat) m.beat = c.beat;
         if (c.seen > m.seen) m.seen = c.seen;
