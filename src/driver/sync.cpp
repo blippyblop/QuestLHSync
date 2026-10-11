@@ -2679,6 +2679,7 @@ void Sync::CellsSweep(double t) {
   for (int cam = 0; cam < 4; cam++) actk_[cam].clear();
   for (auto it = cells_.begin(); it != cells_.end();) {
     SpotCell &cl = it->second;
+    cl.matched = false;
     if (cl.last < t - 45) { it = cells_.erase(it); continue; }
     if (cl.last >= t - 10) { cl.inact = true; actk_[cl.cam].push_back(CellKey(cl.cam, cl.w)); }
     else cl.inact = false;
@@ -2709,7 +2710,7 @@ void Sync::CellsSweep(double t) {
       }
     }
     if (!cl.fuzzy && cl.nO >= 6 && cl.seen >= 20 && t - cl.last < 10)
-      cands_.push_back({cl.q3, cl.res3d, cl.seen});
+      cands_.push_back({cl.q3, cl.res3d, cl.seen, it->first});
     if (cl.vis >= 60 && cl.seen >= 16) {      watched++;
       double rate = (double)cl.seen / cl.vis;
       // lifetime peaks: a lamp's sightings saturate and stay saturated; a dot
@@ -2734,6 +2735,31 @@ void Sync::CellsSweep(double t) {
     log_(Fmt("cameras: %zu direction cells tracked, none old enough to judge yet", cells_.size()));
 }
 
+// layout match every sweep: accepted candidates' cells become the only ray sources (Use gates on
+// cl.matched); three sweeps without an accepted correspondence means x is fitted onto decoys --
+// drop the sightings and re-acquire rather than keep a lock the arrangement says is wrong.
+void Sync::MatchSweep(double t) {
+  if (!solver_.has_x() || (int)cands_.size() < 2) {
+    if (!solver_.has_x()) match_fail_ = 0;
+    return;
+  }
+  std::vector<std::string> keys;
+  std::vector<V3> S, Z, P, Zq;
+  solver_.Stations(keys, S, Z);
+  Solver::Predict(solver_.x(), S, Z, P, Zq);
+  MatchReport mr = MatchLayout(P.data(), (int)P.size());
+  if (mr.ok) {
+    match_fail_ = 0;
+    for (size_t k = 0; k < keys.size() && k < 2; k++) {
+      int ci = k == 0 ? mr.a0 : mr.a1;
+      if (ci >= 0 && ci < (int)cands_.size()) cells_[cands_[ci].key].matched = true;
+    }
+  } else if (++match_fail_ == 3) {
+    log_("layout match: 3 sweeps without an accepted correspondence -- the fit is not on the stations, re-acquiring");
+    solver_.PoseBreak(t);
+  }
+}
+
 void Sync::Use(const Shot &f) {
   if (f.cls == 'S') { spots_.sframe += (int)f.bl.size(); return; }   // S dots are evidence, not rays
   const double t = f.t, hg = f.hg, grid_pc = f.grid_pc;
@@ -2745,7 +2771,7 @@ void Sync::Use(const Shot &f) {
   if (!poses_.At(t, R, p) || !poses_.Speed(t, w)) { spots_.other += nb; return; }
   bool still = poses_.Still(t);
   lastr_[cam] = R;
-  if (optics_.exact_time() && t > cells_next_) { cells_next_ = t + 30; CellsSweep(t); }  // Quest: no direction cells, nothing to sweep (and no log spam)
+  if (optics_.exact_time() && t > cells_next_) { cells_next_ = t + 30; CellsSweep(t); MatchSweep(t); }  // Quest: nothing to sweep or match
   {  // while SteamVR's headset stands still, do the lamps and windows the cameras see stand still too?
     std::vector<std::pair<double, double>> big;
     for (const Spot &b : bl)
@@ -2811,6 +2837,7 @@ void Sync::Use(const Shot &f) {
         if (ps >= 0.15) { spots_.cellskip++; continue; }
       }
       if (cl.fuzzy) { spots_.fuzz++; continue; }   // the direction's rays do not converge on one 3D point: glow, an edge, a lamp face
+      if (match_ok_ && !cl.matched) { spots_.matchskip++; continue; }   // the layout matcher accepted other directions: these rays do not reach the solve
     }
     if (have_lag && cfg_.learn_timing) timing_.Record(grid_pc, o, d, hg, cam, b.peak >= kBright);  // gated rays only on the Frame: lamps must not steer exposure learning; fast turns still feed it (Quest stock order)
     if (w > kWmax) { spots_.fast++; continue; }
@@ -2832,7 +2859,8 @@ std::string Sync::Describe(const Spots &a, const Spots &b) {
   part(b.other - a.other, "without a headset pose");
   part(b.dim - a.dim, "dim, kept for a room too light for the dots to saturate");
   part(b.cellskip - a.cellskip, "directions also lit on short frames (lamps, steady IR)");
-  part(b.fuzz - a.fuzz, "directions that fail the 3D point test (glow, edges)");  part(b.sframe - a.sframe, "short-frame evidence dots");
+  part(b.fuzz - a.fuzz, "directions that fail the 3D point test (glow, edges)");
+  part(b.matchskip - a.matchskip, "directions the layout matcher did not accept");  part(b.sframe - a.sframe, "short-frame evidence dots");
   return Fmt("%ld bright spots, %ld used", n, b.used - a.used) + (why.empty() ? "" : " (" + why + ")");
 }
 

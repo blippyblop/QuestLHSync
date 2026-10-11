@@ -452,7 +452,7 @@ class Sync {
   };
   Status GetStatus(double now);
   // the cameras' bright spots so far, and what became of them
-  struct Spots { long frames = 0, seen = 0, used = 0, still = 0, fast = 0, big = 0, other = 0, dim = 0, cellskip = 0, sframe = 0, fuzz = 0; };
+  struct Spots { long frames = 0, seen = 0, used = 0, still = 0, fast = 0, big = 0, other = 0, dim = 0, cellskip = 0, sframe = 0, fuzz = 0, matchskip = 0; };
   Spots spots() { std::lock_guard<std::mutex> g(net_); return spots_; }
   // per-world-direction dot history (PC-side presence check): a laser dot is
   // present in ~0.7-0.8 of the frames its direction was in view (the rotor
@@ -461,7 +461,7 @@ class Sync {
   struct SpotCell { int cam = 0; V3 w; long seen = 0, vis = 0; float amax = 0, amin = 1e9f; double last = 0; bool lit = false; bool inact = false;
                    std::vector<uint8_t> seqL; std::vector<uint8_t> seqS;  // per-class presence rings: 1 = dot this frame, 0 = in view, none
                    V3 sO[12]; V3 sD[12]; V3 lastO; short nO = 0, slot_ = 0;  // ray samples spread across head travel (3D point test)
-                   float res3d = 0; bool fuzzy = false; V3 q3; };  // RMS residual of the 3D point fit; fuzzy = glow/edge, not an emitter
+                   float res3d = 0; bool fuzzy = false; V3 q3; bool matched = false; };  // fuzzy = glow/edge; matched = accepted by the layout matcher
   std::map<uint64_t, SpotCell> cells_;
   std::vector<uint64_t> actk_[4];   // per camera: keys of recently-active cells (the only ones the per-line marking touches)
   std::map<int, M3> lastr_;          // per camera: last known pose (presence marking)
@@ -470,13 +470,15 @@ class Sync {
   // layout matcher (shadow rollout): candidates from the 3D cell layer vs the predicted slam-space
   // station positions x^-1(S_k). Fixed tolerance floors only -- the forged +-1.4 cm covariance event
   // showed C cannot be trusted as a tolerance.
-  struct Cand { V3 q; float res; long seen; };
+  struct Cand { V3 q; float res; long seen; uint64_t key; };
   std::vector<Cand> cands_;   // rebuilt every CellsSweep
   struct MatchReport { bool ok = false; int npass = 0, a0 = 0, a1 = 0; double best = 0, second = 0, margin = 0; };
   MatchReport MatchLayout(const V3 *P, int n);
+  void MatchSweep(double t);
   bool match_ok_ = false, match_logged_ = false;
   std::string match_sig_;
   double match_next_ = 0;
+  int match_fail_ = 0;
   static uint64_t CellKey(int cam, const V3 &w);
   void CellsFrame(int cam, const M3 &R, double t);
   void CellSeen(int cam, const V3 &w, float peak, double t);
