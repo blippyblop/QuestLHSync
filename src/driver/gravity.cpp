@@ -792,6 +792,15 @@ void Gravity::Report(double now) {
       log_(Fmt("gravity: the level settled at %.2f deg (within %.2f): held for this session", deg, f.sd));
     }
   }
+  // de-flap (2026-10-11: the level flapped 0.58 -> 1.48 -> 1.20 -> 1.78 deg on moving-device IMU
+  // samples, tilting the reference frame ~9 cm at 4 m and shifting the tracker): a CHANGED level
+  // applies only once the estimator repeats itself within 0.15 deg.
+  bool lvl_changed = !held_ && state == 0 && std::hypot(f.tx - fit_.tx, f.tz - fit_.tz) * kDeg > 0.3;
+  bool lvl_repeat = std::hypot(f.tx - ptx_, f.tz - ptz_) * kDeg < 0.15;
+  ptx_ = f.tx; ptz_ = f.tz;
+  if (lvl_changed && !lvl_repeat)
+    log_(Fmt("gravity: the level estimate moved to %.2f deg but has not settled: holding the old level", deg));
+  else {
   {
     std::lock_guard<std::mutex> l(m_);
     fit_ = f;
@@ -800,6 +809,7 @@ void Gravity::Report(double now) {
     fit_.key = key_;
     applying_ = fit_.ok;
     fit_seq_++;
+  }
   }
   // offsets known well enough are kept for the next session
   for (auto &kv : f.off)

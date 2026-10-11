@@ -140,6 +140,7 @@ class Gravity {
   // the level once settled (kHoldAfter): held for the session
   bool held_ = false;
   double settle_since_ = -1, held_tx_ = 0, held_tz_ = 0;
+  double ptx_ = 0, ptz_ = 0;   // previous level estimate, for the de-flap agreement gate
   // Step's
   int seen_seq_ = 0;
   bool on_ = false, good_ = false;

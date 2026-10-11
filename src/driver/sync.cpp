@@ -3279,6 +3279,10 @@ static bool Locked(bool has_x, const StepStat &st) {
 }
 
 Transform Sync::Tick(double now) {
+  if (optics_.exact_time() && !solver_.has_x() && now > acq_next_) {
+    acq_next_ = now + 15;   // the enumerator gets its own fair window, not just sweep ticks that need a pose
+    AcquireFromCandidates(now);
+  }
   if (now - last_step_ >= 1.0) {
     last_step_ = now;
     int b = poses_.brk_id();
