@@ -809,15 +809,17 @@ int Solver::ScoreX(const X4 &x, double gate) {
   Stations(keys, S, Z);
   Predict(x, S, Z, P, Zq);
   Rays r = GetRays(std::max(seen_ - kKeep, since_));
-  int in = 0;
+  std::vector<int> cnt(S.size(), 0);
   for (size_t n = 0; n < r.size(); n++) {
     if (!r.B[n] && !starved_) continue;
     int k;
     double a;
     Nearest(P, Zq, r.O[n], r.D[n], k, a);
-    if (a < gate) in++;
+    if (a < gate) cnt[k]++;
   }
-  return in;
+  // yaw needs TWO stations: score by the second-best station's count, or a fit that piles every
+  // ray on one station (a lamp the alignment happens to sit on) reads as a strong solution.
+  return Score(cnt);
 }
 
 void Solver::Add(double t, V3 o, V3 d, double gt, int cam, bool bright) {
@@ -1763,7 +1765,6 @@ void Solver::CheckIdentity(double now, const std::vector<std::string> &keys, con
 
 // call ~1 Hz. The solver's clock is the newest sighting: with nothing new seen nothing ages out or is refitted
 StepStat Solver::Step(double /*now*/) {
-  if (manual_acq_ && !has_x_) return StepStat();   // the RANSAC acquirer is retired on the Frame, cold AND re-acquire (see the last_acq_ block below): x is only ever set by the candidate enumeration (Sync::AcquireFromCandidates); if that cannot earn an unambiguous answer, the system stays unacquired -- held is better than lied to
   std::vector<std::string> keys;
   std::vector<V3> S, Z;
   Stations(keys, S, Z);
@@ -1779,7 +1780,12 @@ StepStat Solver::Step(double /*now*/) {
     return st;
   }
   double now = seen_ = newest;
+  // starved_ must be kept up to date even while unacquired: the candidate enumeration's ScoreX
+  // counts dim rays only when the room is too light for them to saturate, and on the Frame this is
+  // the only place it is set (RANSAC is retired). Left stale-false, a lit room's station dots stay
+  // "dim" and the enumeration scores nothing. Set it BEFORE the manual-acq return below.
   starved_ = Starved(GetRays(std::max(now - ACQ_WIN, since_)));
+  if (manual_acq_ && !has_x_) return StepStat();   // the RANSAC acquirer is retired on the Frame, cold AND re-acquire (see the last_acq_ block below): x is only ever set by the candidate enumeration (Sync::AcquireFromCandidates); if that cannot earn an unambiguous answer, the system stays unacquired -- held is better than lied to
   StepStat st;
   if (!S.empty() && has_x_) {
     Rays r = GetRays(std::max(now - WIN, since_));
@@ -2787,17 +2793,19 @@ void Sync::CellsSweep(double t) {
       double spread = 0;
       for (int i = 0; i < cl.nO; i++) spread = std::max(spread, norm(cl.sO[i] - c));
       cl.trav = spread >= kParallaxTravel;   // the head moved enough for the angular-offset (parallax) test to mean something
-      if (spread >= 0.25) {
+      if (spread >= 0.25) {   // enough head travel to triangulate at all
         cl.res3d = (float)PointResidual(cl.sO, cl.sD, cl.nO, &cl.q3);
         cl.fuzzy = cl.res3d > 0.08;   // a station aperture stays cm-tight; glow, edges and big lamps smear
+        cl.tri = true;
       }
     }
-    if (!cl.fuzzy && cl.nO >= 6 && cl.seen >= 20 && t - cl.last < 10) {
+    if (cl.tri && !cl.fuzzy && cl.nO >= 6 && cl.seen >= 20 && t - cl.last < 10) {
       int sh = 0;
       for (uint8_t v : cl.seqS) sh += v;
       Cand cd;
       cd.q = cl.q3; cd.res = cl.res3d; cd.seen = cl.seen; cd.key = it->first;
       cd.beat = (float)std::max(BeatScore(cl.ampL, 33.0), BeatScore(cl.seqL, 33.0));
+      cd.beatm = std::max(cl.ampL.size(), cl.seqL.size()) >= 32;   // BeatScore needs 32 samples; below that its 0 is unknown
       cd.keys = {it->first};
       cd.sh = sh; cd.sf = (int)cl.seqS.size();
       cd.dir = Unit(cl.w); cd.dir0 = Unit(cl.w0); cd.cam = cl.cam; cd.trav = cl.trav; cd.ring = cl.seqL;
@@ -2843,7 +2851,9 @@ void Sync::CellsSweep(double t) {
       double d3 = norm(c.q - m.q);
       double drift = std::fabs(sep - AngDeg(c.dir0, m.dir0));
       const char *why = nullptr;
-      if (bh >= kBeatHas && bl < kBeatFlat) why = "contrasting signatures (one beats, one is flat)";
+      // the signature guard needs BOTH beats MEASURED: a short ring scores 0, and reading that as a
+      // flat lamp blocked a station from merging with its own fragments (beats 0.00/7.89 at 0.5 deg).
+      if (c.beatm && m.beatm && bh >= kBeatHas && bl < kBeatFlat) why = "contrasting signatures (one beats, one is flat)";
       else if (std::isfinite(r) && r < kMergeCorr) why = "presence rings not correlated";
       else if (c.res <= kCondRes && m.res <= kCondRes && d3 > kMergeFar) why = "both well-conditioned and far apart in 3D";
       else if (!std::isfinite(r) && c.trav && m.trav && drift > kDriftDeg) why = "angular offset drifts with head travel (parallax)";
@@ -2864,6 +2874,7 @@ void Sync::CellsSweep(double t) {
       }
       m.keys.push_back(c.keys[0]);
       if (c.beat > m.beat) m.beat = c.beat;
+      m.beatm = m.beatm || c.beatm;
       if (c.seen > m.seen) m.seen = c.seen;
       m.sh += c.sh;
       m.sf += c.sf;
@@ -2910,13 +2921,36 @@ void Sync::AcquireFromCandidates(double t) {
       if (i == j) continue;
       V3 vq = cands_[j].q - cands_[i].q, vs = S[1] - S[0];
       if (std::hypot(vq.x, vq.z) < 0.5 || std::hypot(vs.x, vs.z) < 0.5) continue;
-      X4 x = YawFit({cands_[i].q, cands_[j].q}, {S[0], S[1]});
-      int sc = solver_.ScoreX(x, 1.0 / kDeg);
+      // YawFit(A,B) returns the transform mapping A -> B. x maps the LIGHTHOUSE universe onto the
+      // head/SLAM one (x(S) = Ry(yaw)*S + t, as Seed and Hypotheses build it), so the stations go
+      // first and the candidates (SLAM-side 3D points) second. Reversed, x is the inverse map and
+      // ScoreX measures nothing -- the support sits at chance (measured: 0-2 over ~16k rays).
+      // ScoreX's gate is in DEGREES (Nearest returns acos*dDeg); 1.0/kDeg made it 0.0175 deg, so
+      // support was "rays that fit to a hundredth of a degree" -- 0-2, indistinguishable from
+      // chance, and with the RANSAC acquirer retired nothing could ever lock. The gate is 1 deg.
+      X4 x = YawFit({S[0], S[1]}, {cands_[i].q, cands_[j].q});
+      int sc = solver_.ScoreX(x, 1.0);
       double w = sc * (1.0 + 0.25 * std::min(cands_[i].beat, cands_[j].beat));
-      if (w > bw) {
-        ssc = bsc; bw = w; bsc = sc; bi = i; bj = j;
-      } else if (sc > ssc) {
-        ssc = sc;
+      if (w > bw) { bw = w; bsc = sc; bi = i; bj = j; }
+    }
+  }
+  // the runner-up is the best pair that fits a DIFFERENT alignment. When one source splits across
+  // several candidates (a starburst's arms, the same dot in two cameras), many pairs fit the SAME
+  // x; scored against the best they read as a nearly-equal second solution and the enumeration
+  // holds forever (measured: 455 vs 326, same two stations both ways). Ambiguity is about distinct
+  // x, not distinct pairs, so a pair within kSameX of the best is the same answer, not a rival.
+  if (bi >= 0) {
+    X4 xb = YawFit({S[0], S[1]}, {cands_[bi].q, cands_[bj].q});
+    const double kSameX = 1.0;   // m: two fits predicting the stations within this are one solution
+    for (int i = 0; i < (int)cands_.size(); i++) {
+      for (int j = 0; j < (int)cands_.size(); j++) {
+        if (i == j) continue;
+        V3 vq = cands_[j].q - cands_[i].q, vs = S[1] - S[0];
+        if (std::hypot(vq.x, vq.z) < 0.5 || std::hypot(vs.x, vs.z) < 0.5) continue;
+        X4 x = YawFit({S[0], S[1]}, {cands_[i].q, cands_[j].q});
+        if (Apart(x, xb, S) <= kSameX) continue;
+        int sc = solver_.ScoreX(x, 1.0);
+        if (sc > ssc) ssc = sc;
       }
     }
   }
@@ -2926,7 +2960,7 @@ void Sync::AcquireFromCandidates(double t) {
              bi >= 0 && bsc >= 20 && (ssc == 0 || bsc >= 2 * ssc) ? "" : " -- ambiguous or unsupported: holding"));
   }
   if (bi < 0 || bsc < 20 || (ssc > 0 && bsc < 2 * ssc)) return;
-  X4 x = YawFit({cands_[bi].q, cands_[bj].q}, {S[0], S[1]});
+  X4 x = YawFit({S[0], S[1]}, {cands_[bi].q, cands_[bj].q});
   solver_.Reset(x);
   solver_.SetLockTime(t);
   log_(Fmt("acquired by enumeration: candidates %d,%d support %d (runner-up %d, beats %.2f/%.2f) yaw %+.2f deg t [%.2f %.2f %.2f]",
