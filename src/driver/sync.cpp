@@ -2684,7 +2684,7 @@ void Sync::Use(const Shot &f) {
   if (!poses_.At(t, R, p) || !poses_.Speed(t, w)) { spots_.other += nb; return; }
   bool still = poses_.Still(t);
   lastr_[cam] = R;
-  if (t > cells_next_) { cells_next_ = t + 30; CellsSweep(t); }
+  if (optics_.exact_time() && t > cells_next_) { cells_next_ = t + 30; CellsSweep(t); }  // Quest: no direction cells, nothing to sweep (and no log spam)
   {  // while SteamVR's headset stands still, do the lamps and windows the cameras see stand still too?
     std::vector<std::pair<double, double>> big;
     for (const Spot &b : bl)
@@ -2714,11 +2714,9 @@ void Sync::Use(const Shot &f) {
       fprintf(g_ray_dump, "R %.6f %d %.6f %.6f %.6f %.7f %.7f %.7f %.6f %.6f %.6f %.1f %d\n", t, cam, O.x, O.y, O.z, D.x,
               D.y, D.z, p.x, p.y, p.z, w, b.peak);
     }
-    if (w > kWmax) { spots_.fast++; continue; }
     if (optics_.exact_time()) {  // Steam Frame only; Quest keeps stock behavior
       V3 W = R * d;
-      CellSeen(cam, W, (float)b.peak, t);
-      SpotCell &cl = cells_[CellKey(cam, W)];
+      CellSeen(cam, W, (float)b.peak, t);      SpotCell &cl = cells_[CellKey(cam, W)];
       // PRIMARY filter: short-frame presence. The lighthouse's sweeps are
       // microsecond-wide and unsynced with the S exposure, so a real dot is
       // ~absent from S frames (measured 0.00 over thousands of frames). A
@@ -2742,7 +2740,8 @@ void Sync::Use(const Shot &f) {
         if (ps >= 0.15) { spots_.cellskip++; continue; }
       }
     }
-    if (have_lag && cfg_.learn_timing) timing_.Record(grid_pc, o, d, hg, cam, b.peak >= kBright);  // gated rays only: lamps must not steer exposure learning
+    if (have_lag && cfg_.learn_timing) timing_.Record(grid_pc, o, d, hg, cam, b.peak >= kBright);  // gated rays only on the Frame: lamps must not steer exposure learning; fast turns still feed it (Quest stock order)
+    if (w > kWmax) { spots_.fast++; continue; }
     bool bright = b.peak >= kBright;
     solver_.Add(t, p + R * o, R * d, hg, cam, bright);  // dim ones too: they tell when the room is too light
     if (bright || solver_.starved()) spots_.used++;
