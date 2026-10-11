@@ -2705,6 +2705,7 @@ void Sync::CellsSweep(double t) {
   for (auto it = cells_.begin(); it != cells_.end();) {
     SpotCell &cl = it->second;
     cl.matched = false;
+    cl.mains = false;
     if (cl.last < t - 45) { it = cells_.erase(it); continue; }
     if (cl.last >= t - 10) { cl.inact = true; actk_[cl.cam].push_back(CellKey(cl.cam, cl.w)); }
     else cl.inact = false;
@@ -2734,9 +2735,12 @@ void Sync::CellsSweep(double t) {
         cl.fuzzy = cl.res3d > 0.08;   // a station aperture stays cm-tight; glow, edges and big lamps smear
       }
     }
-    if (!cl.fuzzy && cl.nO >= 6 && cl.seen >= 20 && t - cl.last < 10)
+    if (!cl.fuzzy && cl.nO >= 6 && cl.seen >= 20 && t - cl.last < 10) {
+      int sh = 0;
+      for (uint8_t v : cl.seqS) sh += v;
       raw.push_back({cl.q3, cl.res3d, cl.seen, it->first,
-                     (float)std::max(BeatScore(cl.ampL, 33.0), BeatScore(cl.seqL, 33.0)), {it->first}});
+                     (float)std::max(BeatScore(cl.ampL, 33.0), BeatScore(cl.seqL, 33.0)), {it->first}, sh, (int)cl.seqS.size()});
+    }
     if (cl.vis >= 60 && cl.seen >= 16) {      watched++;
       double rate = (double)cl.seen / cl.vis;
       // lifetime peaks: a lamp's sightings saturate and stay saturated; a dot
@@ -2766,11 +2770,23 @@ void Sync::CellsSweep(double t) {
         m.keys.push_back(c.keys[0]);
         if (c.beat > m.beat) m.beat = c.beat;
         if (c.seen > m.seen) m.seen = c.seen;
+        m.sh += c.sh;
+        m.sf += c.sf;
         merged = true;
         break;
       }
     }
     if (!merged) cands_.push_back(c);
+  }
+  // the S-frame verdict, at CANDIDATE level: a source's S-evidence pools across its merged
+  // starburst members, so a lamp dies WHOLE -- before, arms with thin rings could keep a gated
+  // core's family alive. Mains candidates are removed from the matcher's list entirely and their
+  // member cells carry the verdict to the ray gate in Use.
+  for (auto ci = cands_.begin(); ci != cands_.end();) {
+    bool mains = ci->sf >= 8 && (double)ci->sh / ci->sf >= 0.15;
+    for (uint64_t k : ci->keys) cells_[k].mains = mains;
+    if (mains) ci = cands_.erase(ci);
+    else ++ci;
   }
   if (watched > 0 && best_seen > 0)
     log_(Fmt("cameras: %ld presence checks, highest %.0f%% (%ld/%ld), %ld judged steady -- a real station sits near 70-85%%",
@@ -2879,14 +2895,10 @@ void Sync::Use(const Shot &f) {
       // catches a flash, the laser's presence pegs at 1.0 and ANY
       // presence-threshold on the L ring false-negatives the real station.
       // Short-frame presence has the clean measured margin, so it alone
-      // gates.
-      size_t ns = cl.seqS.size();
-      if (ns >= 8) {
-        int os = 0;
-        for (uint8_t v : cl.seqS) os += v;
-        double ps = (double)os / ns;
-        if (ps >= 0.15) { spots_.cellskip++; continue; }
-      }
+      // gates -- at CANDIDATE level (CellsSweep): a source's S-evidence pools
+      // across its merged starburst members, so a lamp dies whole instead of
+      // surviving through arms with thin rings. The verdict rides the cell.
+      if (cl.mains) { spots_.cellskip++; continue; }
       if (cl.fuzzy) { spots_.fuzz++; continue; }   // the direction's rays do not converge on one 3D point: glow, an edge, a lamp face
       if (match_ok_ && !cl.matched) { spots_.matchskip++; continue; }   // the layout matcher accepted other directions: these rays do not reach the solve
     }

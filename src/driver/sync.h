@@ -462,7 +462,7 @@ class Sync {
                    std::vector<uint8_t> seqL; std::vector<uint8_t> seqS;  // per-class presence rings: 1 = dot this frame, 0 = in view, none
                    std::vector<uint8_t> ampL;  // peak ring on long frames: the rotor beat lives in AMPLITUDE (presence pegs)
                    V3 sO[12]; V3 sD[12]; V3 lastO; short nO = 0, slot_ = 0;  // ray samples spread across head travel (3D point test)
-                   float res3d = 0; bool fuzzy = false; V3 q3; bool matched = false; };  // fuzzy = glow/edge; matched = accepted by the layout matcher
+                   float res3d = 0; bool fuzzy = false; V3 q3; bool matched = false; bool mains = false; };  // fuzzy = glow/edge; matched = layout matcher; mains = S-frame verdict (candidate level)
   std::map<uint64_t, SpotCell> cells_;
   std::vector<uint64_t> actk_[4];   // per camera: keys of recently-active cells (the only ones the per-line marking touches)
   std::map<int, M3> lastr_;          // per camera: last known pose (presence marking)
@@ -471,7 +471,7 @@ class Sync {
   // layout matcher (shadow rollout): candidates from the 3D cell layer vs the predicted slam-space
   // station positions x^-1(S_k). Fixed tolerance floors only -- the forged +-1.4 cm covariance event
   // showed C cannot be trusted as a tolerance.
-  struct Cand { V3 q; float res; long seen; uint64_t key; float beat = 0; std::vector<uint64_t> keys; };
+  struct Cand { V3 q; float res; long seen; uint64_t key; float beat = 0; std::vector<uint64_t> keys; int sh = 0, sf = 0; };
   std::vector<Cand> cands_;   // rebuilt every CellsSweep
   struct MatchReport { bool ok = false; int npass = 0, a0 = 0, a1 = 0; double best = 0, second = 0, margin = 0; };
   MatchReport MatchLayout(const V3 *P, int n);
