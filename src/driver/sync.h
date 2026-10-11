@@ -460,6 +460,7 @@ class Sync {
   // ~1.0 and always saturated. Measured first, gated conservatively.
   struct SpotCell { int cam = 0; V3 w; long seen = 0, vis = 0; float amax = 0, amin = 1e9f; double last = 0; bool lit = false; bool inact = false;
                    std::vector<uint8_t> seqL; std::vector<uint8_t> seqS;  // per-class presence rings: 1 = dot this frame, 0 = in view, none
+                   std::vector<uint8_t> ampL;  // peak ring on long frames: the rotor beat lives in AMPLITUDE (presence pegs)
                    V3 sO[12]; V3 sD[12]; V3 lastO; short nO = 0, slot_ = 0;  // ray samples spread across head travel (3D point test)
                    float res3d = 0; bool fuzzy = false; V3 q3; bool matched = false; };  // fuzzy = glow/edge; matched = accepted by the layout matcher
   std::map<uint64_t, SpotCell> cells_;

@@ -2615,6 +2615,8 @@ void Sync::CellSeen(int cam, const V3 &w, float peak, double t) {
   if (cl.seen == 0) { cl.cam = cam; cl.w = w; }
   else cl.w = cl.w + (w - cl.w) * 0.1;
   cl.seen++; cl.last = t;
+  cl.ampL.push_back((uint8_t)std::min(255.0f, peak));   // the beat lives in amplitude, not presence
+  if (cl.ampL.size() > 64) cl.ampL.erase(cl.ampL.begin());
   cl.amax = std::max(cl.amax, peak);
   cl.amin = std::min(cl.amin, peak);
 }
@@ -2733,7 +2735,8 @@ void Sync::CellsSweep(double t) {
       }
     }
     if (!cl.fuzzy && cl.nO >= 6 && cl.seen >= 20 && t - cl.last < 10)
-      raw.push_back({cl.q3, cl.res3d, cl.seen, it->first, (float)BeatScore(cl.seqL, 33.0), {it->first}});
+      raw.push_back({cl.q3, cl.res3d, cl.seen, it->first,
+                     (float)std::max(BeatScore(cl.ampL, 33.0), BeatScore(cl.seqL, 33.0)), {it->first}});
     if (cl.vis >= 60 && cl.seen >= 16) {      watched++;
       double rate = (double)cl.seen / cl.vis;
       // lifetime peaks: a lamp's sightings saturate and stay saturated; a dot
@@ -2805,8 +2808,7 @@ void Sync::MatchSweep(double t) {
     for (size_t i = 0; i < cands_.size() && i < 6; i++)
       s += Fmt("  q[%.1f %.1f %.1f] beat %.2f seen %ld%s", cands_[i].q.x, cands_[i].q.y, cands_[i].q.z,
                cands_[i].beat, cands_[i].seen, cands_[i].keys.size() > 1 ? Fmt(" (%d arms)", (int)cands_[i].keys.size() - 1).c_str() : "");
-    log_(Fmt("candidates: %zu.%s", cands_.size(), s.c_str()));
-  }
+    log_(Fmt("candidates: %zu.%s", cands_.size(), s.c_str()));  }
 }
 
 void Sync::Use(const Shot &f) {
