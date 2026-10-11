@@ -2647,7 +2647,7 @@ void Sync::CellSeen(int cam, const V3 &w, float peak, double t) {
   uint64_t k = CellKey(cam, w);
   SpotCell &cl = cells_[k];
   if (!cl.inact) { cl.inact = true; actk_[cam].push_back(k); }
-  if (cl.seen == 0) { cl.cam = cam; cl.w = w; }
+  if (cl.seen == 0) { cl.cam = cam; cl.w = w; cl.w0 = w; }
   else cl.w = cl.w + (w - cl.w) * 0.1;
   cl.seen++; cl.last = t;
   cl.ampL.push_back((uint8_t)std::min(255.0f, peak));   // the beat lives in amplitude, not presence
@@ -2682,6 +2682,27 @@ static double BeatScore(const std::vector<uint8_t> &ring, double fs) {
     if (m > best) best = m;
   }
   return sum > 0 ? best / (sum / 24) : 0;
+}
+// unit vector, guarding a degenerate input (a zero direction would make every angle NaN)
+static V3 Unit(V3 v) { double n = norm(v); return n > 1e-9 ? v * (1.0 / n) : V3{0, 0, 1}; }
+static double AngDeg(V3 a, V3 b) {
+  return std::acos(std::max(-1.0, std::min(1.0, dot(Unit(a), Unit(b))))) * kDeg;
+}
+// Pearson correlation of two presence rings, aligned at the tail: two cells of one camera append
+// a sample per in-view frame in lockstep, so their tails are the same frames. NAN when there is
+// too little overlap or either ring is flat -- correlation is then UNDEFINED, not zero, and the
+// caller falls to the parallax tie-break instead of blocking.
+static double RingCorr(const std::vector<uint8_t> &a, const std::vector<uint8_t> &b) {
+  int n = (int)std::min(a.size(), b.size());
+  if (n < 24) return std::numeric_limits<double>::quiet_NaN();
+  const uint8_t *A = a.data() + (a.size() - n), *B = b.data() + (b.size() - n);
+  double ma = 0, mb = 0;
+  for (int i = 0; i < n; i++) { ma += A[i]; mb += B[i]; }
+  ma /= n; mb /= n;
+  double sa = 0, sb = 0, sab = 0;
+  for (int i = 0; i < n; i++) { double x = A[i] - ma, y = B[i] - mb; sa += x * x; sb += y * y; sab += x * y; }
+  if (sa < 1e-9 || sb < 1e-9) return std::numeric_limits<double>::quiet_NaN();
+  return sab / std::sqrt(sa * sb);
 }
 static double PointResidual(const V3 *O, const V3 *D, int n, V3 *qout = nullptr) {
   auto fit = [&](const int *idx, int k, double out[3]) {
@@ -2765,6 +2786,7 @@ void Sync::CellsSweep(double t) {
       c = c * (1.0f / cl.nO);
       double spread = 0;
       for (int i = 0; i < cl.nO; i++) spread = std::max(spread, norm(cl.sO[i] - c));
+      cl.trav = spread >= kParallaxTravel;   // the head moved enough for the angular-offset (parallax) test to mean something
       if (spread >= 0.25) {
         cl.res3d = (float)PointResidual(cl.sO, cl.sD, cl.nO, &cl.q3);
         cl.fuzzy = cl.res3d > 0.08;   // a station aperture stays cm-tight; glow, edges and big lamps smear
@@ -2773,8 +2795,13 @@ void Sync::CellsSweep(double t) {
     if (!cl.fuzzy && cl.nO >= 6 && cl.seen >= 20 && t - cl.last < 10) {
       int sh = 0;
       for (uint8_t v : cl.seqS) sh += v;
-      raw.push_back({cl.q3, cl.res3d, cl.seen, it->first,
-                     (float)std::max(BeatScore(cl.ampL, 33.0), BeatScore(cl.seqL, 33.0)), {it->first}, sh, (int)cl.seqS.size()});
+      Cand cd;
+      cd.q = cl.q3; cd.res = cl.res3d; cd.seen = cl.seen; cd.key = it->first;
+      cd.beat = (float)std::max(BeatScore(cl.ampL, 33.0), BeatScore(cl.seqL, 33.0));
+      cd.keys = {it->first};
+      cd.sh = sh; cd.sf = (int)cl.seqS.size();
+      cd.dir = Unit(cl.w); cd.dir0 = Unit(cl.w0); cd.cam = cl.cam; cd.trav = cl.trav; cd.ring = cl.seqL;
+      raw.push_back(std::move(cd));
     }
     if (cl.vis >= 60 && cl.seen >= 16) {      watched++;
       double rate = (double)cl.seen / cl.vis;
@@ -2793,25 +2820,55 @@ void Sync::CellsSweep(double t) {
     }
     ++it;
   }
-  // merge starburst fragments: one source must be ONE candidate. Arms sit within ~0.3 m of the
-  // core at room range (1.5-3 deg) and flicker with it, so position proximity + greedy core-first
-  // merge collapses them; the merged candidate carries every member key (all arms gate together)
-  // and the best member's beat score. Floor note: a real station ~0.5 m from a lamp must NOT
-  // merge with it (the lamp's S-verdict would kill the station), so the radius stays under that.
-  const double kMergeR = 0.3;
+  // merge starburst fragments IN ANGLE: a starburst is an optical effect, so its arms sit at a
+  // roughly fixed ANGULAR offset from the core (a few degrees, whatever the range) and modulate
+  // together -- a fixed 3D radius is a different angle at every range (17 deg at 1 m, 2 deg at
+  // 8 m) and arm 3D points have poor parallax anyway. Greedy, core-first (the most-seen direction
+  // is the core). A pair merges when the directions are within kMergeDeg AND the evidence says one
+  // source: same camera + correlated presence rings; never across contrasting signatures (one
+  // rotor beat, one flat -- a station beside a lamp); 3D distance is a VETO, not the criterion
+  // (both well-conditioned and clearly far apart = two sources); and when the correlation is
+  // unavailable (different camera, or a flat ring) the parallax tie-break decides: a starburst's
+  // angular offset holds as the head travels, two real sources at different depths drift apart.
+  // The merged candidate carries every member key (all arms gate together) and the best beat.
   std::sort(raw.begin(), raw.end(), [](const Cand &a, const Cand &b) { return a.seen > b.seen; });
+  int mlog = 0, rlog = 0;
   for (const Cand &c : raw) {
     bool merged = false;
     for (Cand &m : cands_) {
-      if (norm(m.q - c.q) <= kMergeR) {
-        m.keys.push_back(c.keys[0]);
-        if (c.beat > m.beat) m.beat = c.beat;
-        if (c.seen > m.seen) m.seen = c.seen;
-        m.sh += c.sh;
-        m.sf += c.sf;
-        merged = true;
-        break;
+      double sep = AngDeg(c.dir, m.dir);
+      if (sep > kMergeDeg) continue;
+      double r = (c.cam >= 0 && c.cam == m.cam) ? RingCorr(c.ring, m.ring) : std::numeric_limits<double>::quiet_NaN();
+      double bh = std::max(c.beat, m.beat), bl = std::min(c.beat, m.beat);
+      double d3 = norm(c.q - m.q);
+      double drift = std::fabs(sep - AngDeg(c.dir0, m.dir0));
+      const char *why = nullptr;
+      if (bh >= kBeatHas && bl < kBeatFlat) why = "contrasting signatures (one beats, one is flat)";
+      else if (std::isfinite(r) && r < kMergeCorr) why = "presence rings not correlated";
+      else if (c.res <= kCondRes && m.res <= kCondRes && d3 > kMergeFar) why = "both well-conditioned and far apart in 3D";
+      else if (!std::isfinite(r) && c.trav && m.trav && drift > kDriftDeg) why = "angular offset drifts with head travel (parallax)";
+      std::string rs = std::isfinite(r) ? Fmt("%.2f", r) : std::string("n/a");
+      std::string dr = (c.trav && m.trav) ? Fmt(", drift %.2f deg", drift) : std::string();
+      if (why) {
+        if (rlog < 6) {
+          rlog++;
+          log_(Fmt("merge: held q[%.1f %.1f %.1f] apart from q[%.1f %.1f %.1f]: %.1f deg, corr %s, beats %.2f/%.2f, 3D %.2f m%s -- %s",
+                   c.q.x, c.q.y, c.q.z, m.q.x, m.q.y, m.q.z, sep, rs.c_str(), c.beat, m.beat, d3, dr.c_str(), why));
+        }
+        continue;
       }
+      if (mlog < 10) {
+        mlog++;
+        log_(Fmt("merge: q[%.1f %.1f %.1f] <- q[%.1f %.1f %.1f]: %.1f deg, corr %s, beats %.2f/%.2f, 3D %.2f m%s",
+                 m.q.x, m.q.y, m.q.z, c.q.x, c.q.y, c.q.z, sep, rs.c_str(), c.beat, m.beat, d3, dr.c_str()));
+      }
+      m.keys.push_back(c.keys[0]);
+      if (c.beat > m.beat) m.beat = c.beat;
+      if (c.seen > m.seen) m.seen = c.seen;
+      m.sh += c.sh;
+      m.sf += c.sf;
+      merged = true;
+      break;
     }
     if (!merged) cands_.push_back(c);
   }

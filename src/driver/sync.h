@@ -57,6 +57,17 @@ constexpr int kMaxPx = 400;             // bigger blobs are lamps/windows, not a
 // the running fit only within Solver::INLIER of a station
 constexpr int kBright = 250;
 constexpr int kLampPx = 20;             // blobs this big are steady lights (the frozen-pose check)
+// starburst merge, IN ANGLE (not a fixed 3D radius): arms sit at a roughly fixed angular offset
+// from the core, whatever the range, so same-frame directions within kMergeDeg whose presence
+// rings come and go together are one source. Contrasting signatures stay apart (a station beside
+// a lamp); 3D distance is a veto only, never the criterion.
+constexpr double kMergeDeg = 3.0;        // deg: directions this close may be one starburst
+constexpr double kMergeCorr = 0.5;       // ring correlation; below this they appear/disappear apart
+constexpr double kDriftDeg = 0.6;        // deg: head-travel change in the angular offset; more = parallax (two depths)
+constexpr double kMergeFar = 1.0;        // m: both well-conditioned and this far apart in 3D = two sources
+constexpr double kCondRes = 0.05;        // m: 3D residual this tight = well-conditioned (the veto needs it)
+constexpr double kBeatHas = 2.0, kBeatFlat = 1.0;  // rotor beat present vs flat (stations ~3-9, lamps ~0 in the field)
+constexpr double kParallaxTravel = 0.4;  // m: head travel before the parallax tie-break is trusted
 // a camera frame whose head pose hasn't come in yet waits for it this long: a learned timing can put the pose time
 // after the frame's arrival (the Frame's Steam Link: -6 ms, the newest pose then a few ms short of it)
 constexpr double kPoseWait = 0.1;       // s
@@ -464,11 +475,12 @@ class Sync {
   // present in ~0.7-0.8 of the frames its direction was in view (the rotor
   // sweeps miss the exposure window at the beat period); a lamp or window is
   // ~1.0 and always saturated. Measured first, gated conservatively.
-  struct SpotCell { int cam = 0; V3 w; long seen = 0, vis = 0; float amax = 0, amin = 1e9f; double last = 0; bool lit = false; bool inact = false;
+  struct SpotCell { int cam = 0; V3 w; V3 w0;  // w0 = the first direction seen (the parallax tie-break's "then")
+                   long seen = 0, vis = 0; float amax = 0, amin = 1e9f; double last = 0; bool lit = false; bool inact = false;
                    std::vector<uint8_t> seqL; std::vector<uint8_t> seqS;  // per-class presence rings: 1 = dot this frame, 0 = in view, none
                    std::vector<uint8_t> ampL;  // peak ring on long frames: the rotor beat lives in AMPLITUDE (presence pegs)
                    V3 sO[12]; V3 sD[12]; V3 lastO; short nO = 0, slot_ = 0;  // ray samples spread across head travel (3D point test)
-                   float res3d = 0; bool fuzzy = false; V3 q3; bool matched = false; bool mains = false; };  // fuzzy = glow/edge; matched = layout matcher; mains = S-frame verdict (candidate level)
+                   float res3d = 0; bool fuzzy = false; V3 q3; bool matched = false; bool mains = false; bool trav = false; };  // fuzzy = glow/edge; matched = layout matcher; mains = S-frame verdict (candidate level); trav = head traveled far enough for the parallax test
   std::map<uint64_t, SpotCell> cells_;
   std::vector<uint64_t> actk_[4];   // per camera: keys of recently-active cells (the only ones the per-line marking touches)
   std::map<int, M3> lastr_;          // per camera: last known pose (presence marking)
@@ -477,7 +489,8 @@ class Sync {
   // layout matcher (shadow rollout): candidates from the 3D cell layer vs the predicted slam-space
   // station positions x^-1(S_k). Fixed tolerance floors only -- the forged +-1.4 cm covariance event
   // showed C cannot be trusted as a tolerance.
-  struct Cand { V3 q; float res; long seen; uint64_t key; float beat = 0; std::vector<uint64_t> keys; int sh = 0, sf = 0; };
+  struct Cand { V3 q; float res; long seen; uint64_t key; float beat = 0; std::vector<uint64_t> keys; int sh = 0, sf = 0;
+                V3 dir, dir0; int cam = -1; bool trav = false; std::vector<uint8_t> ring; };  // angular merge: direction now/first, camera, head traveled, L presence ring
   std::vector<Cand> cands_;   // rebuilt every CellsSweep
   struct MatchReport { bool ok = false; int npass = 0, a0 = 0, a1 = 0; double best = 0, second = 0, margin = 0; };
   MatchReport MatchLayout(const V3 *P, int n);
