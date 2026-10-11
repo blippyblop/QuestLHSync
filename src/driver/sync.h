@@ -296,6 +296,7 @@ class Solver {
   StepStat Step(double now);
   bool has_x() const { return has_x_; }
   X4 x() const { return x_; }   // valid only when has_x(); the layout matcher reads it
+  int ScoreX(const X4 &x, double gate);   // rays within gate of any predicted station direction (acquisition enumeration)
   bool starved() const { return starved_; }
   int resets() const { return resets_; }  // stations (sorted by serial) as the solver uses them
   void Stations(std::vector<std::string> &keys, std::vector<V3> &S, std::vector<V3> &Z) const;
@@ -476,6 +477,7 @@ class Sync {
   struct MatchReport { bool ok = false; int npass = 0, a0 = 0, a1 = 0; double best = 0, second = 0, margin = 0; };
   MatchReport MatchLayout(const V3 *P, int n);
   void MatchSweep(double t);
+  void AcquireFromCandidates(double t);
   bool match_ok_ = false, match_logged_ = false;
   std::string match_sig_;
   double match_next_ = 0;

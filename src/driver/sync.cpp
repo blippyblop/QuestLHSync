@@ -802,6 +802,24 @@ void Solver::Reset(const X4 &x) {
   id_said_.clear();
 }
 
+// support for a candidate x: recent rays within gate of any predicted station direction
+int Solver::ScoreX(const X4 &x, double gate) {
+  std::vector<std::string> keys;
+  std::vector<V3> S, Z, P, Zq;
+  Stations(keys, S, Z);
+  Predict(x, S, Z, P, Zq);
+  Rays r = GetRays(std::max(seen_ - kKeep, since_));
+  int in = 0;
+  for (size_t n = 0; n < r.size(); n++) {
+    if (!r.B[n] && !starved_) continue;
+    int k;
+    double a;
+    Nearest(P, Zq, r.O[n], r.D[n], k, a);
+    if (a < gate) in++;
+  }
+  return in;
+}
+
 void Solver::Add(double t, V3 o, V3 d, double gt, int cam, bool bright) {
   std::lock_guard<std::mutex> g(m_);
   rt_.push_back(t); ro_.push_back(o); rd_.push_back(d); rg_.push_back(gt); rc_.push_back(cam); rb_.push_back(bright);
@@ -2265,13 +2283,7 @@ Sync::Sync(SyncConfig cfg, LogFn log)
   else
     log_("no stations.json yet: the reference frame is set the first time base stations show up");
   LoadState();
-  // a place kept by earlier sessions holds a little looser in this one: what this one sees can still move it
-  for (auto &kv : sfile_.place) {
-    StationsFile::Place p = kv.second;
-    p.sd_d = std::hypot(p.sd_d, kPlaceAge);
-    p.sd_h = std::hypot(p.sd_h, kPlaceAge);
-    place_prior_[kv.first] = p;
-  }
+  // the camera-measured 'place' prior is retired (see PlaceStep): SteamVR's layout is the prior
 }
 
 Sync::~Sync() {}
@@ -2800,9 +2812,49 @@ void Sync::CellsSweep(double t) {
 // layout match every sweep: accepted candidates' cells become the only ray sources (Use gates on
 // cl.matched); three sweeps without an accepted correspondence means x is fitted onto decoys --
 // drop the sightings and re-acquire rather than keep a lock the arrangement says is wrong.
+// acquisition enumeration: candidate pairs -> closed-form 4-DOF per assignment (YawFit maps the
+// pair onto the SteamVR pair) -> support score over recent rays. Accept only an unambiguous
+// winner: real support and twice the runner-up. The rotor-beat score softly tips ties between a
+// decoy pair and the real pair (stations beat, lamps and reflections do not). Ambiguity holds:
+// x stays unset and the sweep comes back around.
+void Sync::AcquireFromCandidates(double t) {
+  if ((int)cands_.size() < 2) return;
+  std::vector<std::string> keys;
+  std::vector<V3> S, Z;
+  solver_.Stations(keys, S, Z);
+  if (S.size() != 2) return;
+  int bi = -1, bj = -1, bsc = 0, ssc = 0;
+  double bw = -1;
+  for (int i = 0; i < (int)cands_.size(); i++) {
+    for (int j = 0; j < (int)cands_.size(); j++) {
+      if (i == j) continue;
+      V3 vq = cands_[j].q - cands_[i].q, vs = S[1] - S[0];
+      if (std::hypot(vq.x, vq.z) < 0.5 || std::hypot(vs.x, vs.z) < 0.5) continue;
+      X4 x = YawFit({cands_[i].q, cands_[j].q}, {S[0], S[1]});
+      int sc = solver_.ScoreX(x, 1.0 / kDeg);
+      double w = sc * (1.0 + 0.25 * std::min(cands_[i].beat, cands_[j].beat));
+      if (w > bw) {
+        ssc = bsc; bw = w; bsc = sc; bi = i; bj = j;
+      } else if (sc > ssc) {
+        ssc = sc;
+      }
+    }
+  }
+  if (t > cand_log_) {   // shares the 60 s evidence-watch throttle
+    cand_log_ = t + 60;
+    log_(Fmt("acquisition: %d candidate pairs scored, best support %d (runner-up %d)%s", bi < 0 ? 0 : (int)cands_.size() * ((int)cands_.size() - 1), bsc, ssc,
+             bi >= 0 && bsc >= 20 && (ssc == 0 || bsc >= 2 * ssc) ? "" : " -- ambiguous or unsupported: holding"));
+  }
+  if (bi < 0 || bsc < 20 || (ssc > 0 && bsc < 2 * ssc)) return;
+  X4 x = YawFit({cands_[bi].q, cands_[bj].q}, {S[0], S[1]});
+  solver_.Reset(x);
+  log_(Fmt("acquired by enumeration: candidates %d,%d support %d (runner-up %d, beats %.2f/%.2f) yaw %+.2f deg t [%.2f %.2f %.2f]",
+           bi, bj, bsc, ssc, cands_[bi].beat, cands_[bj].beat, x[0] * 180 / kPi, x[1], x[2], x[3]));
+}
+
 void Sync::MatchSweep(double t) {
   if (!solver_.has_x() || (int)cands_.size() < 2) {
-    if (!solver_.has_x()) match_fail_ = 0;
+    if (!solver_.has_x()) { match_fail_ = 0; AcquireFromCandidates(t); }
     return;
   }
   std::vector<std::string> keys;
@@ -3100,7 +3152,7 @@ void Sync::PlaceStep(const std::map<std::string, std::pair<V3, M3>> &raw, double
   if (!TwoStations(raw, other)) return;
   {   // SHADOW rollout: the matcher logs its verdict beside the legacy path; flip kMatcherGates
       // after replaying the light-pin and swap cases. Fixed floors; no covariance tolerance.
-    constexpr bool kMatcherGates = false;
+    constexpr bool kMatcherGates = true;   // field-proven 2026-10-11: the override flip-flopped 4.41 -> 4.85 m (forged +-1.2 cm) while SteamVR held 4.92 m
     std::vector<std::string> keys;
     std::vector<V3> S, Z, P, Zq;
     solver_.Stations(keys, S, Z);
@@ -3118,9 +3170,9 @@ void Sync::PlaceStep(const std::map<std::string, std::pair<V3, M3>> &raw, double
       else
         log_("layout match: no candidate within 0.5 m of the predicted stations -- would reject the override");
     }
-    if (kMatcherGates && !mr.ok) return;   // decision rule: ambiguous or nothing passes -> leave x unchanged
-  }
-  std::map<std::string, Solver::Seen> seen;
+    if (!mr.ok) return;   // decision rule: ambiguous or nothing passes -> leave x unchanged
+    return;   // the camera-measured baseline override is RETIRED: placement is x and SteamVR's layout, period
+  }  std::map<std::string, Solver::Seen> seen;
   if (!solver_.Triangulate(seen) || !seen.count(sfile_.anchor) || !seen.count(other)) return;
   const Solver::Seen &a = seen[sfile_.anchor], &b = seen[other];
   V3 v = b.q - a.q;
