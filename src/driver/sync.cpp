@@ -1762,7 +1762,7 @@ void Solver::CheckIdentity(double now, const std::vector<std::string> &keys, con
 }
 
 // call ~1 Hz. The solver's clock is the newest sighting: with nothing new seen nothing ages out or is refitted
-StepStat Solver::Step(double now) {
+StepStat Solver::Step(double /*now*/) {
   if (manual_acq_ && !has_x_) return StepStat();   // the RANSAC acquirer is retired on the Frame: x is only set by the candidate enumeration (Sync::AcquireFromCandidates); if that cannot earn an unambiguous answer, the system stays unacquired -- held is better than lied to
   std::vector<std::string> keys;
   std::vector<V3> S, Z;
