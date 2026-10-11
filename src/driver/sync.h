@@ -296,6 +296,8 @@ class Solver {
   StepStat Step(double now);
   bool has_x() const { return has_x_; }
   X4 x() const { return x_; }   // valid only when has_x(); the layout matcher reads it
+  void SetManualAcq(bool m) { manual_acq_ = m; }   // Frame: x is only ever set by the candidate enumeration; the RANSAC path is retired
+  bool manual_acq_ = false;
   int ScoreX(const X4 &x, double gate);   // rays within gate of any predicted station direction (acquisition enumeration)
   bool starved() const { return starved_; }
   int resets() const { return resets_; }  // stations (sorted by serial) as the solver uses them

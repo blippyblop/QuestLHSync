@@ -1763,6 +1763,7 @@ void Solver::CheckIdentity(double now, const std::vector<std::string> &keys, con
 
 // call ~1 Hz. The solver's clock is the newest sighting: with nothing new seen nothing ages out or is refitted
 StepStat Solver::Step(double /*now*/) {
+  if (manual_acq_ && !has_x_) return StepStat();   // the RANSAC acquirer is retired on the Frame: x is only set by the candidate enumeration (Sync::AcquireFromCandidates); if that cannot earn an unambiguous answer, the system stays unacquired -- held is better than lied to
   std::vector<std::string> keys;
   std::vector<V3> S, Z;
   Stations(keys, S, Z);
@@ -3283,6 +3284,7 @@ Transform Sync::Tick(double now) {
     acq_next_ = now + 15;   // the enumerator gets its own fair window, not just sweep ticks that need a pose
     AcquireFromCandidates(now);
   }
+  solver_.SetManualAcq(optics_.exact_time());   // lighthouse axiom: locks are only ever earned through the candidate pipeline; there is no fallback acquirer
   if (now - last_step_ >= 1.0) {
     last_step_ = now;
     int b = poses_.brk_id();
