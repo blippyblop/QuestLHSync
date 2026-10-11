@@ -1762,7 +1762,7 @@ void Solver::CheckIdentity(double now, const std::vector<std::string> &keys, con
 }
 
 // call ~1 Hz. The solver's clock is the newest sighting: with nothing new seen nothing ages out or is refitted
-StepStat Solver::Step(double /*now*/) {
+StepStat Solver::Step(double now) {
   if (manual_acq_ && !has_x_) return StepStat();   // the RANSAC acquirer is retired on the Frame: x is only set by the candidate enumeration (Sync::AcquireFromCandidates); if that cannot earn an unambiguous answer, the system stays unacquired -- held is better than lied to
   std::vector<std::string> keys;
   std::vector<V3> S, Z;
@@ -1802,8 +1802,26 @@ StepStat Solver::Step(double /*now*/) {
       }
       FitR f = Fit(x_, S, Z, r, now, GATE, has_anchor_ ? &anchor_ : nullptr, nullptr, DimGate());
       if (f.ok) {
-        x_ = f.x;
-        if (f.cond || !has_anchor_) { anchor_ = f.x; has_anchor_ = true; }
+        // BOUNDED REFINEMENT -- lighthouses are anchors: they are the fixed points the whole
+        // system exists around, so the fit may polish centimeters but may never wander. A
+        // correction past the slew (5 cm/update) or drift past the cap (30 cm from the blessed
+        // anchor) is held; a run of held corrections is the lock itself confessing -- drop x and
+        // re-earn through the candidate pipeline. No bound on re-earning: there is no motion to
+        // model, only lies to evict.
+        double dstep = Apart(f.x, x_, S), danchor = has_anchor_ ? Apart(f.x, anchor_, S) : 0.0;
+        if (now - x_since_ > 10 && (dstep > 0.05 || danchor > 0.30)) {
+          if (++sat_count_ == 1)
+            log_(Fmt("the fit pushed past its bound (%.0f cm step, %.0f cm from the anchor): holding the old pose", dstep * 100, danchor * 100));
+          if (sat_count_ >= 10) {
+            log_("the fit kept pushing past its bound for 10 s: the lock is wrong -- re-earning through the candidate pipeline");
+            sat_count_ = 0;
+            PoseBreak(now);
+          }
+        } else {
+          sat_count_ = 0;
+          x_ = f.x;
+          if (f.cond || !has_anchor_) { anchor_ = f.x; has_anchor_ = true; }
+        }
       }
       st.cond = f.cond;
       std::vector<int> cnt;
@@ -2849,6 +2867,7 @@ void Sync::AcquireFromCandidates(double t) {
   if (bi < 0 || bsc < 20 || (ssc > 0 && bsc < 2 * ssc)) return;
   X4 x = YawFit({cands_[bi].q, cands_[bj].q}, {S[0], S[1]});
   solver_.Reset(x);
+  solver_.SetLockTime(t);
   log_(Fmt("acquired by enumeration: candidates %d,%d support %d (runner-up %d, beats %.2f/%.2f) yaw %+.2f deg t [%.2f %.2f %.2f]",
            bi, bj, bsc, ssc, cands_[bi].beat, cands_[bj].beat, x[0] * 180 / kPi, x[1], x[2], x[3]));
 }
