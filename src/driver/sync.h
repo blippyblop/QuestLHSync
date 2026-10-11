@@ -483,7 +483,6 @@ class Sync {
   double match_next_ = 0;
   int match_fail_ = 0;
   double cand_log_ = 0, acq_next_ = 0;
-  X4 prior_x_{}; double prior_t_ = -1e9;   // last matcher-accepted x: continuity prior for re-acquisition
   static uint64_t CellKey(int cam, const V3 &w);
   void CellsFrame(int cam, const M3 &R, double t);
   void CellSeen(int cam, const V3 &w, float peak, double t);
