@@ -2833,6 +2833,11 @@ void Sync::AcquireFromCandidates(double t) {
       X4 x = YawFit({cands_[i].q, cands_[j].q}, {S[0], S[1]});
       int sc = solver_.ScoreX(x, 1.0 / kDeg);
       double w = sc * (1.0 + 0.25 * std::min(cands_[i].beat, cands_[j].beat));
+      // continuity: while a matcher-accepted prior is fresh, an assignment that lands the
+      // stations where the prior did gets a 1.5x bonus -- a re-acquire must not dethrone a
+      // good lock over noise, and a true dethroning still wins if it has the support.
+      bool near_prior = t - prior_t_ < 600 && Apart(x, prior_x_, S) < 0.3;
+      if (near_prior) w *= 1.5;
       if (w > bw) {
         ssc = bsc; bw = w; bsc = sc; bi = i; bj = j;
       } else if (sc > ssc) {
@@ -2864,6 +2869,7 @@ void Sync::MatchSweep(double t) {
   MatchReport mr = MatchLayout(P.data(), (int)P.size());
   if (mr.ok) {
     match_fail_ = 0;
+    prior_x_ = solver_.x(); prior_t_ = t;   // the matcher has blessed this x: it is the re-acquisition prior
     for (size_t k = 0; k < keys.size() && k < 2; k++) {
       int ci = k == 0 ? mr.a0 : mr.a1;
       if (ci >= 0 && ci < (int)cands_.size()) cells_[cands_[ci].key].matched = true;
