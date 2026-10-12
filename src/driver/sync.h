@@ -121,6 +121,13 @@ double RotorPeriod(int channel);  // s, a 2.0 base station on channel 1..16, els
 // only LoadFrame sets `use`, so nothing is left out there
 constexpr double kUpward = 0.1;
 
+// projection-based presence (PresenceAt): how far a blob may sit from a candidate's projected pixel
+// and still count. MEASURED (qlhs_presence, 2026-10-11): at 3 px a station reads 9-24% of its long
+// frames because a 20 ms exposure of a turning head smears the dot; at 12 px 55-74%, at 25 px 81-84%
+// -- the 70-85% the design expects for a station. The short frames read 12-17% throughout, so the
+// S/L contrast (a station ~0.17, a lamp ~1) is what separates, not the absolute short rate.
+constexpr double kPresPx = 12.0, kPresWin = 20.0;  // px, s
+
 struct CamCal {
   bool valid = false;
   bool use = true;   // looks where base stations hang (the Frame's two upper ones); all on a Quest
@@ -141,6 +148,7 @@ class Optics {
   bool Ray(int cam, double x, double y, V3 &o, V3 &d) const;  // device frame
   bool Pose(int cam, M3 &R, V3 &t) const;                     // device <- camera
   bool InImage(int cam, V3 dc, double margin) const;          // a camera-frame direction lands on the image
+  bool Project(int cam, V3 dc, double &px, double &py) const;  // ... and where: the pixel it falls on, 0..w/h
   // The cut is a RUNTIME TOGGLE (SteamVR setting "upperCameras", default on): `use` is the geometry (which cameras look
   // up, set once at LoadFrame), upper_only_ decides whether it is applied. Off, all calibrated cameras count, so the
   // two can be A/B tested without rebuilding.
@@ -528,14 +536,14 @@ class Sync {
                    float res3d = 0; bool fuzzy = false; V3 q3; bool matched = false; bool mains = false; bool trav = false; bool tri = false; };  // fuzzy = glow/edge; matched = layout matcher; mains = S-frame verdict (candidate level); trav = head traveled far enough for the parallax test; tri = a 3D point was actually fitted
   std::map<uint64_t, SpotCell> cells_;
   std::vector<uint64_t> actk_[4];   // per camera: keys of recently-active cells (the only ones the per-line marking touches)
-  std::map<int, M3> lastr_;          // per camera: last known pose (presence marking)
   double cells_next_ = 0;
   long cells_dropped_ = 0;
   // layout matcher (shadow rollout): candidates from the 3D cell layer vs the predicted slam-space
   // station positions x^-1(S_k). Fixed tolerance floors only -- the forged +-1.4 cm covariance event
   // showed C cannot be trusted as a tolerance.
   struct Cand { V3 q; float res; long seen; uint64_t key; float beat = 0; bool beatm = false; std::vector<uint64_t> keys; int sh = 0, sf = 0;
-                V3 dir, dir0; int cam = -1; bool trav = false; std::vector<uint8_t> ring; };  // angular merge: direction now/first, camera, head traveled, L presence ring; beatm = the beat score was measurable (a short ring scores 0, which is "unknown", not "flat")
+                V3 dir, dir0; int cam = -1; bool trav = false; bool mains = false; std::vector<uint8_t> ring;
+                int pl = 0, pln = 0, ps = 0, psn = 0; };  // projection presence: long/short hits over the frames the place was in image  // angular merge: direction now/first, camera, head traveled, L presence ring; beatm = the beat score was measurable (a short ring scores 0, which is "unknown", not "flat")
   std::vector<Cand> cands_;   // rebuilt every CellsSweep
   struct MatchReport { bool ok = false; int npass = 0, a0 = 0, a1 = 0; double best = 0, second = 0, margin = 0; };
   MatchReport MatchLayout(const V3 *P, int n);
@@ -599,8 +607,15 @@ class Sync {
   long img_moved_ = 0, img_still_ = 0;  // under net_: of those, while SteamVR's headset stands still
   // under net_: short frames waiting for their head pose (kPoseWait), in arrival order
   struct Spot { int x10, y10, npx, peak; };
+  void MarkPresence(int cam, const M3 &R, double t, char cls, const std::vector<Spot> &bl);  // the class presence rings
+  // the recent frames, for the projection test: a candidate is a PLACE, and a place is tested by
+  // projecting it, not by keying a direction cell (which the station rolls across as the head moves)
+  struct FRec { double t; int cam; char cls = 'L'; M3 R; V3 p; std::vector<Spot> bl; };
+  void Remember(double t, int cam, char cls, const M3 &R, const V3 &p, const std::vector<Spot> &bl);
+  void PresenceAt(std::vector<Cand> &c, double t);
   struct Shot { double pc, t, hg, grid_pc; int cam; bool have_lag; char cls = 'L'; std::vector<Spot> bl; };
   std::deque<Shot> waiting_;
+  std::deque<FRec> frecs_;  // the last kPresWin s of frames, for PresenceAt
   void Use(const Shot &f);  // under net_
   double still_since_ = -1;
   bool frozen_said_ = false;

@@ -247,12 +247,21 @@ bool Optics::Pose(int cam, M3 &R, V3 &t) const {
   return true;
 }
 
-bool Optics::InImage(int cam, V3 dc, double margin) const {
+// a camera-frame direction -> the pixel it lands on, or false if it is off the image (or behind)
+bool Optics::Project(int cam, V3 dc, double &px, double &py) const {
   if (cam < 0 || cam >= kMaxCam || !cams_[cam].valid || !(dc.z > 0.05)) return false;
   const CamCal &c = cams_[cam];
   double u, v;
   c.Dist(dc.x / dc.z, dc.y / dc.z, u, v);
-  double x = c.cx + c.f * u / c.ir, y = c.cy + c.fy * v / c.ir;
+  px = c.cx + c.f * u / c.ir;
+  py = c.cy + c.fy * v / c.ir;
+  return px >= 0 && py >= 0 && px <= c.w && py <= c.h;
+}
+
+bool Optics::InImage(int cam, V3 dc, double margin) const {
+  double x, y;
+  if (!Project(cam, dc, x, y)) return false;
+  const CamCal &c = cams_[cam];
   return x >= margin && y >= margin && x <= c.w - margin && y <= c.h - margin;
 }
 
@@ -2978,54 +2987,11 @@ void Sync::OnLine(double pc, const char *line) {
       was = p;
     }
   }
-  // presence marking: EVERY frame counts coverage for the direction cells it
-  // had in view (0), and blob frames mark their dots (1). The sequence, not
-  // its average, is the modulation signal: a laser dot's misses arrive in
-  // rotor-locked bursts; a lamp's ring is a flat run of 1s. The cone uses the
-  // camera's last known pose -- it moves slowly, fine for counting.
-  // Steam Frame only (the cells exist for the short-presence gate below);
-  // Quest lines are untagged and keep stock behavior entirely.
+  // The presence rings are NOT advanced here any more. They are advanced in Use, with the FRAME'S
+  // OWN pose and only for cells whose direction was actually on that camera's image: see
+  // Sync::MarkPresence. Here we only classify the line and queue it.
   char cls = xcls ? xcls : (nb > 0 ? 'S' : 'L');   // evidence class: untagged dots sit on short frames (Quest)
   bool solve = !xcls || xcls == 'L';               // untagged lines are stock Quest semantics: dots are rays
-  auto lr = lastr_.find(cam);
-  if (optics_.exact_time() && lr != lastr_.end()) {
-    V3 axis = lr->second * V3{0, 0, 1};
-    for (uint64_t ak : actk_[cam]) {
-      auto it = cells_.find(ak);
-      if (it == cells_.end()) continue;
-      SpotCell &cl = it->second;
-      if (dot(cl.w, axis) <= -0.2) continue;
-      std::vector<uint8_t> &ring = cls == 'L' ? cl.seqL : cl.seqS;
-      ring.push_back(0);
-      if (ring.size() > 64) ring.erase(ring.begin());
-      if (cls == 'L') cl.vis++;   // the never-blinks rate's denominator: long frames with the direction in view
-    }
-    if (nb > 0) {
-      const char *s2 = line + off;
-      for (int i = 0; i < nb; i++) {
-        int x10, y10, npx2, peak2, used = 0;
-        if (sscanf(s2, " %d %d %d %d%n", &x10, &y10, &npx2, &peak2, &used) < 4) break;
-        s2 += used;
-        V3 o, d;
-        if (optics_.Ray(cam, x10 / 10.0 - 0.5, y10 / 10.0 - 0.5, o, d)) {
-          V3 W = lr->second * d;
-          auto it = cells_.find(CellKey(cam, W));
-          if (it != cells_.end() && !it->second.seqL.empty() && !it->second.seqS.empty()) {
-            (cls == 'L' ? it->second.seqL : it->second.seqS).back() = 1;
-          }
-        }
-      }
-    }
-  }
-  if (!solve) {
-    // tagged-S dots are evidence (already marked into the cells above) and
-    // never enter the timing grid or the solver: the pose-time model is built
-    // for one frame class, and mixing them bent rays alternately by ~4 ms.
-    // Untagged lines (stock lhsight on Quest) are short-frame dots that DO
-    // solve -- only lhsight2's explicit 'S' tag makes a line evidence-only.
-    spots_.sframe += nb;
-    return;
-  }
   std::vector<Spot> bl;
   {
     const char *s = line + off;
@@ -3037,6 +3003,28 @@ void Sync::OnLine(double pc, const char *line) {
     }
   }
   nb = (int)bl.size();
+  if (!solve) {
+    // tagged-S dots are evidence, not rays: no grid, no solver. They are still queued, because the
+    // class rings are marked from the frame's own pose like the long ones -- that pose is not known
+    // until the frame comes round in Use, so an S line has to wait its turn like an L line.
+    // Untagged lines (stock lhsight on Quest) are short-frame dots that DO solve -- only
+    // lhsight2's explicit 'S' tag makes a line evidence-only.
+    spots_.sframe += nb;
+    if (!nb || !have_optics_ || !optics_.exact_time()) return;
+    double sgrid;
+    if (have_lag && clock_.Map(hs, sgrid)) {
+      waiting_.push_back({pc, sgrid - expo_, hs, sgrid, cam, have_lag, 'S', std::move(bl)});
+      while (!waiting_.empty()) {
+        V3 lp;
+        double lt;
+        const Shot &f = waiting_.front();
+        if (!(pc - f.pc >= kPoseWait || (poses_.Latest(lp, &lt) && lt > f.t))) break;
+        Use(f);
+        waiting_.pop_front();
+      }
+    }
+    return;
+  }
   spots_.frames++;
   spots_.seen += nb;
   if (!nb) return;   // dotless frames feed the grid above only
@@ -3079,10 +3067,95 @@ void Sync::CellSeen(int cam, const V3 &w, float peak, double t) {
   if (cl.seen == 0) { cl.cam = cam; cl.w = w; cl.w0 = w; }
   else cl.w = cl.w + (w - cl.w) * 0.1;
   cl.seen++; cl.last = t;
-  cl.ampL.push_back((uint8_t)std::min(255.0f, peak));   // the beat lives in amplitude, not presence
-  if (cl.ampL.size() > 64) cl.ampL.erase(cl.ampL.begin());
+  // ampL is NOT pushed here: it is advanced by MarkPresence, one sample per long frame, 0 when the
+  // dot is absent. A run of only the hits is not a time series and has no rotor beat in it.
   cl.amax = std::max(cl.amax, peak);
   cl.amin = std::min(cl.amin, peak);
+}
+
+// The class presence rings: one sample per frame per direction cell whose direction was ON THIS
+// CAMERA'S IMAGE that frame, set when one of the frame's blobs lands in the same cell.
+//
+// Two things this fixes, both measured (qlhs_presence on the 2026-10-11 recording):
+//  - the pose. OnLine marked with the camera's "last known pose", which is the PREVIOUS frame's:
+//    under head motion the mark lands one cell over, and 32% of all marks missed the cell they
+//    belonged to (23,562 of 74,772). Here R is the frame's own pose, the same one its rays use.
+//  - the denominator. OnLine counted a frame as coverage when the cell was merely within a ~101 deg
+//    cone of the optical axis (dot(w, axis) > -0.2, i.e. in front of the camera, mostly off-image).
+//    That is 56-67% of frames where the direction is really on the image only 27-40% of the time,
+//    so every cell collected ~2x too many zeros. InImage is the honest test.
+// The two together read a base station's own cell at ~4%; its real rate is 22-40% (L) and 5-7% (S).
+void Sync::MarkPresence(int cam, const M3 &R, double t, char cls, const std::vector<Spot> &bl) {
+  (void)t;
+  M3 Rc; V3 tc;
+  if (!optics_.Pose(cam, Rc, tc)) return;
+  // the cells this frame's blobs land in (key -> the brightest peak, for the amplitude ring)
+  std::vector<std::pair<uint64_t, int>> hit;
+  for (const Spot &b : bl) {
+    V3 o, d;
+    if (!optics_.Ray(cam, b.x10 / 10.0 - 0.5, b.y10 / 10.0 - 0.5, o, d)) continue;
+    hit.push_back({CellKey(cam, R * d), b.peak});
+  }
+  const M3 Rt = T(R), Rct = T(Rc);
+  for (uint64_t ak : actk_[cam]) {
+    auto it = cells_.find(ak);
+    if (it == cells_.end()) continue;
+    SpotCell &cl = it->second;
+    V3 dc = Rct * (Rt * cl.w);   // the cell's direction, in this camera's frame
+    if (!optics_.InImage(cam, dc, 0)) continue;
+    int pk = 0;
+    bool on = false;
+    for (auto &e : hit)
+      if (e.first == ak) { on = true; if (e.second > pk) pk = e.second; }
+    std::vector<uint8_t> &ring = cls == 'L' ? cl.seqL : cl.seqS;
+    ring.push_back(on ? 1 : 0);
+    if (ring.size() > 64) ring.erase(ring.begin());
+    if (cls == 'L') {
+      cl.vis++;   // the never-blinks rate's denominator: long frames with the direction on the image
+      cl.ampL.push_back(on ? (uint8_t)std::min(255, pk) : 0);   // zero-filled by frame: a hit-run is not a beat
+      if (cl.ampL.size() > 64) cl.ampL.erase(cl.ampL.begin());
+    }
+  }
+}
+
+// The recent frames, for the projection test. A candidate is a 3D PLACE, and a place is tested by
+// projecting it -- not by keying a direction cell, which a real source rolls across as the head
+// translates (a fixed cell key reads 16-37% where the place itself is lit on 80% of long frames).
+void Sync::Remember(double t, int cam, char cls, const M3 &R, const V3 &p, const std::vector<Spot> &bl) {
+  FRec f;
+  f.t = t; f.cam = cam; f.cls = cls; f.R = R; f.p = p; f.bl = bl;
+  frecs_.push_back(std::move(f));
+  for (int guard = 0; guard < 64 && frecs_.size() > 8; guard++) {
+    if (t - frecs_.front().t <= kPresWin) break;
+    frecs_.pop_front();
+  }
+}
+
+// Projection-based presence: for each candidate, the frames in which it was on a camera's image and
+// whether a blob sat on the pixel it projects to, per exposure class. This is the honest version of
+// the rings: no denominator wasted on frames where the direction was only loosely "in front", no
+// marker sweeping off the cell as the head moves. MEASURED for a base station (qlhs_presence,
+// 2026-10-11): 81-84% of the long frames it is in image for -- the design's 70-85% -- and 12-17% of
+// the short ones, so the S verdict has to be the CONTRAST of the two, never the absolute short rate.
+void Sync::PresenceAt(std::vector<Cand> &c, double t) {
+  if (frecs_.empty()) return;
+  for (Cand &cd : c) {
+    for (const FRec &f : frecs_) {
+      if (t - f.t > kPresWin) continue;
+      M3 Rc; V3 tc;
+      if (!optics_.Pose(f.cam, Rc, tc)) continue;
+      V3 W = cd.q - (f.p + f.R * tc);
+      if (norm(W) < 0.2) continue;
+      double px, py;
+      if (!optics_.Project(f.cam, T(Rc) * (T(f.R) * W), px, py)) continue;
+      bool on = false;
+      for (const Spot &b : f.bl) {
+        double dx = b.x10 / 10.0 - 0.5 - px, dy = b.y10 / 10.0 - 0.5 - py;
+        if (dx * dx + dy * dy <= kPresPx * kPresPx) { on = true; break; }
+      }
+      if (f.cls == 'L') { cd.pln++; cd.pl += on ? 1 : 0; } else { cd.psn++; cd.ps += on ? 1 : 0; }
+    }
+  }
 }
 
 // periodic: promote near-continuous fully-saturated directions to "lit"
@@ -3251,6 +3324,7 @@ void Sync::CellsSweep(double t) {
     }
     ++it;
   }
+  PresenceAt(raw, t);   // the projection test, before the merge: the arms of one place pool their evidence
   // merge starburst fragments IN ANGLE: a starburst is an optical effect, so its arms sit at a
   // roughly fixed ANGULAR offset from the core (a few degrees, whatever the range) and modulate
   // together -- a fixed 3D radius is a different angle at every range (17 deg at 1 m, 2 deg at
@@ -3301,6 +3375,7 @@ void Sync::CellsSweep(double t) {
       if (c.seen > m.seen) m.seen = c.seen;
       m.sh += c.sh;
       m.sf += c.sf;
+      m.pl += c.pl; m.pln += c.pln; m.ps += c.ps; m.psn += c.psn;
       merged = true;
       break;
     }
@@ -3310,18 +3385,32 @@ void Sync::CellsSweep(double t) {
   // starburst members, so a lamp dies WHOLE -- before, arms with thin rings could keep a gated
   // core's family alive. Mains candidates are removed from the matcher's list entirely and their
   // member cells carry the verdict to the ray gate in Use.
-  int dropped_mains = 0;
+  //
+  // PARKED: the verdict is computed and logged, but not applied. The gate's evidence is the very
+  // ring that was broken until now, and the ground truth (qlhs_presence) says a real base station
+  // is NOT absent from the short frames -- it reads 5-7% (LHB-904ECE4F 4.9, LHB-EC8BB104 6.8) where
+  // this threshold asks for 15%. That is a 2x margin, not the "0.00 against 0.15-0.5" the rule was
+  // written for, so it earns its place only once the rings read correctly and the margin has been
+  // measured on more rooms. Flip kApplyMainsGate when it has.
+  constexpr bool kApplyMainsGate = false;
+  int dropped_mains = 0, would_mains = 0;
   for (auto ci = cands_.begin(); ci != cands_.end();) {
     bool mains = ci->sf >= 8 && (double)ci->sh / ci->sf >= 0.15;
+    if (mains) would_mains++;
+    if (!kApplyMainsGate) { ci->mains = mains; ++ci; continue; }
     for (uint64_t k : ci->keys) cells_[k].mains = mains;
     if (mains) { ci = cands_.erase(ci); dropped_mains++; }
     else ++ci;
   }
   // the S-gate's own activity: it is only live if the class rings are real (the tag parse bug left seqS empty of 1s,
-  // so nothing was ever dropped and the gate read as "working" while doing nothing)
+  // so nothing was ever dropped and the gate read as "working" while doing nothing). Parked, it still says what it
+  // would have done -- that is the number to watch while the rings are validated.
   if (dropped_mains)
     log_(Fmt("S-gate: %d candidate(s) dropped as steady sources (seen on 8+ short frames, %.0f%%+ short-presence)",
              dropped_mains, 15.0));
+  else if (kApplyMainsGate && would_mains)
+    log_(Fmt("S-gate: %d candidate(s) carry the steady-source verdict (8+ short frames, %.0f%%+ short-presence)", would_mains,
+             15.0));
   // NAMING, diagnostic only (no decision hangs on it yet). A 2.0 base station's rotors sweep at a fixed period, so
   // the frames that see one station's dot modulate at ITS channel; matching a candidate's sighting train to the known
   // channel periods names it. Upstream names stations only after a lock (CheckIdentity); naming the CANDIDATE is what
@@ -3393,9 +3482,9 @@ void Sync::CellsSweep(double t) {
         bool clear = sc[b] - other >= kNamed;
         int l1 = 0;
         for (uint8_t e : cd.ring) l1 += e;
-        log_(Fmt("candidate naming: q[%.1f %.1f %.1f] seen %ld: %s (%.3f, next %.3f) on %d frames, %d seen; L %d/%zu S %d/%d",
+        log_(Fmt("candidate naming: q[%.1f %.1f %.1f] seen %ld: %s (%.3f, next %.3f) on %d frames, %d seen; L %d/%zu S %d/%d; proj L %d/%d S %d/%d",
                  cd.q.x, cd.q.y, cd.q.z, cd.seen, clear ? cn[b].c_str() : "no channel", sc[b], other, (int)v.size(), seen,
-                 l1, cd.ring.size(), cd.sh, cd.sf));
+                 l1, cd.ring.size(), cd.sh, cd.sf, cd.pl, cd.pln, cd.ps, cd.psn));
       }
     }
   }
@@ -3534,17 +3623,27 @@ void Sync::MatchSweep(double t) {
 }
 
 void Sync::Use(const Shot &f) {
-  if (f.cls == 'S') { spots_.sframe += (int)f.bl.size(); return; }   // S dots are evidence, not rays
   const double t = f.t, hg = f.hg, grid_pc = f.grid_pc;
   const int cam = f.cam, nb = (int)f.bl.size();
   const bool have_lag = f.have_lag;
   const std::vector<Spot> &bl = f.bl;
   M3 R; V3 p;
   double w;
-  if (!poses_.At(t, R, p) || !poses_.Speed(t, w)) { spots_.other += nb; return; }
+  const bool have_pose = poses_.At(t, R, p);
+  if (f.cls == 'S') {   // evidence only: the short frames mark the class rings and carry no rays
+    spots_.sframe += nb;
+    if (have_pose) {
+      if (optics_.exact_time()) MarkPresence(cam, R, t, 'S', bl);
+      Remember(t, cam, 'S', R, p, bl);
+    }
+    return;
+  }
+  if (!have_pose || !poses_.Speed(t, w)) { spots_.other += nb; return; }
   bool still = poses_.Still(t);
-  lastr_[cam] = R;
   if (optics_.exact_time() && t > cells_next_) { cells_next_ = t + 30; CellsSweep(t); MatchSweep(t); }  // Quest: nothing to sweep or match
+  // presence, with the frame's own pose, for both classes (see MarkPresence)
+  if (optics_.exact_time()) MarkPresence(cam, R, t, 'L', bl);
+  Remember(t, cam, 'L', R, p, bl);
   {  // while SteamVR's headset stands still, do the lamps and windows the cameras see stand still too?
     std::vector<std::pair<double, double>> big;
     for (const Spot &b : bl)
