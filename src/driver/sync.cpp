@@ -218,6 +218,7 @@ bool Optics::LoadFrame(const JVal &root, std::string *err) {
 }
 
 std::string Optics::Unused() const {
+  if (!upper_only_) return "";
   std::string s;
   for (int i = 0; i < kMaxCam; i++)
     if (cams_[i].valid && !cams_[i].use) s += (s.empty() ? "" : ", ") + std::to_string(i);
@@ -2397,12 +2398,25 @@ bool Sync::Seed(const std::map<std::string, V3> &raw, X4 &x, double &miss) {
   return true;
 }
 
+void Sync::SetUpperOnly(bool on) {
+  std::lock_guard<std::mutex> g(net_);
+  if (on == optics_.upper_only()) return;
+  optics_.SetUpperOnly(on);
+  if (!have_optics_) return;
+  std::string left = optics_.Unused();
+  if (!left.empty())
+    log_("cameras " + left + " left out: they look down, the base stations hang above");
+  else
+    log_("cameras: all of them count again (the Frame's lower pair included)");
+}
+
 bool Sync::SetCalibration(const std::string &json, std::string *err) {
   std::lock_guard<std::mutex> g(net_);
   if (!optics_.Load(json, err)) return false;
   have_optics_ = true;
   std::string left_out = optics_.Unused();
   if (!left_out.empty()) log_("cameras " + left_out + " left out: they look down, the base stations hang above");
+  else if (optics_.exact_time() && !optics_.upper_only()) log_("cameras: every camera counts (the upper-only cut is off)");
   // a Quest's frame period is one of two, the Frame's is learned from its frames
   grid_quest_ = !optics_.exact_time() && !cfg_.learn_grid;
   grid_ = FrameGrid(grid_quest_);

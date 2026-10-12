@@ -462,6 +462,8 @@ class Provider : public vr::IServerTrackedDeviceProvider {
   std::string hmd_model_, hmd_system_;
   std::string receiver_[vr::k_unMaxTrackedDeviceCount];
   double last_gravity_ = 0;
+  double last_upper_ = 0;
+  bool upper_ = true;  // the "upperCameras" setting: the Frame's down-looking cameras are left out (default on)
   std::atomic<bool> wired_{false};  // SteamVR's headset is wired (not streamed): everything here stays off
   bool any_hmd_ = false, recording_ = false, overlay_started_ = false, steady_ = true, rel_done_ = true;
   bool stood_down_ = false;  // the worker's, once wired: hooks out, search and levelling stopped
@@ -495,6 +497,20 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     g_rel->SetEnabled(steady_);
     bool rec = s->GetBool(kSection, "record", &e);
     SetRecording(e == vr::VRSettingsError_None && rec);
+    ApplyUpper();
+  }
+
+  // the Frame's down-looking cameras are left out unless "upperCameras" is false; the worker re-reads it every couple
+  // of seconds so a run can be A/B tested by flipping the setting (steamvr.vrsettings) without a restart
+  void ApplyUpper() {
+    auto *s = vr::VRSettings();
+    vr::EVRSettingsError e = vr::VRSettingsError_None;
+    bool on = s->GetBool(kSection, "upperCameras", &e);
+    if (e != vr::VRSettingsError_None) on = true;  // unset: upstream's cut, on
+    if (on == upper_) return;
+    upper_ = on;
+    g_sync->SetUpperOnly(on);
+    Log(on ? "upper cameras only: the Frame's lower pair is left out" : "all cameras: the Frame's lower pair counts too");
   }
 
   void SetRecording(bool on) {
@@ -683,6 +699,10 @@ class Provider : public vr::IServerTrackedDeviceProvider {
       Stations();
       Commands();
       WriteXf(g_sync->Tick(now));
+      if (now - last_upper_ >= 2) {
+        last_upper_ = now;
+        ApplyUpper();
+      }
       if (now - last_gravity_ >= 1) {
         last_gravity_ = now;
         Gravity::Ref ref;

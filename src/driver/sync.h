@@ -138,9 +138,15 @@ class Optics {
   bool Ray(int cam, double x, double y, V3 &o, V3 &d) const;  // device frame
   bool Pose(int cam, M3 &R, V3 &t) const;                     // device <- camera
   bool InImage(int cam, V3 dc, double margin) const;          // a camera-frame direction lands on the image
-  bool Used(int cam) const { return cam >= 0 && cam < kMaxCam && cams_[cam].valid && cams_[cam].use; }  // its sightings count
-  bool Skip(int cam) const { return cam >= 0 && cam < kMaxCam && cams_[cam].valid && !cams_[cam].use; }  // calibrated, left out
-  std::string Unused() const;  // "0, 1": the calibrated cameras left out, "" for none
+  // The cut is a RUNTIME TOGGLE (SteamVR setting "upperCameras", default on): `use` is the geometry (which cameras look
+  // up, set once at LoadFrame), upper_only_ decides whether it is applied. Off, all calibrated cameras count, so the
+  // two can be A/B tested without rebuilding.
+  bool Used(int cam) const { return cam >= 0 && cam < kMaxCam && cams_[cam].valid && (!upper_only_ || cams_[cam].use); }
+  bool Skip(int cam) const { return cam >= 0 && cam < kMaxCam && cams_[cam].valid && upper_only_ && !cams_[cam].use; }
+  void SetUpperOnly(bool b) { upper_only_ = b; }
+  bool upper_only() const { return upper_only_; }
+  // "0, 1": the calibrated cameras left out while the cut is on, "" when it is off or none is
+  std::string Unused() const;
   const std::string &device() const { return device_; }       // "Seacliff" (Quest Pro), "Eureka" (Quest 3), ...
   bool exact_time() const { return exact_time_; }  // frame times are the frames' own, no poll lag to take off
 
@@ -148,6 +154,7 @@ class Optics {
   CamCal cams_[kMaxCam];
   std::string device_;
   bool exact_time_ = false;
+  bool upper_only_ = true;   // the Frame's down-looking cameras are left out (Sync::SetUpperOnly, the "upperCameras" setting)
   bool LoadFrame(const JVal &root, std::string *err);
 };
 
@@ -461,6 +468,10 @@ class Sync {
   void SetStationsRaw(const std::map<std::string, std::pair<V3, M3>> &raw);
   void SetChannels(const std::map<std::string, int> &ch);
   void SetStreamer(const std::string &system);
+  // the Frame's down-looking cameras are left out (upstream #38); off, every calibrated camera counts. Live-switchable
+  // from the driver's "upperCameras" setting, for A/B testing. Cells already made for the lower cameras stay until they
+  // age out, so a session wants a fresh start to compare cleanly
+  void SetUpperOnly(bool on);
   // 20 Hz; returns the transform for the lighthouse devices
   Transform Tick(double now);
   bool WillStep(double now) const { return now - last_step_ >= 1.0; }
