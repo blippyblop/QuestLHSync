@@ -202,11 +202,26 @@ bool Optics::LoadFrame(const JVal &root, std::string *err) {
     if (err) *err = "no usable camera in xrservice.json (KB4 intrinsics, extrinsics)";
     return false;
   }
+  // The lower pair looks down and forward, at the floor and the hands; the base stations hang above. In two Frame
+  // recordings only the two looking up ever matched a station, while the others sent most of the bright spots (lamps,
+  // glints). They're left out, whatever their index (xrservice.json names them upper_left/upper_right, but the
+  // geometry is what counts). If no camera qualifies the file is odd: all are used as before.
+  int up = 0;
+  for (int i = 0; i < kMaxCam; i++) up += out[i].valid && out[i].R.m[1][2] > kUpward;
+  if (up)
+    for (int i = 0; i < kMaxCam; i++) out[i].use = out[i].valid && out[i].R.m[1][2] > kUpward;
   for (int i = 0; i < kMaxCam; i++) cams_[i] = out[i];
   const JVal *model = dc->get("model_number");
   device_ = model && model->t == JVal::Str ? model->s : "Steam Frame";
   exact_time_ = true;
   return true;
+}
+
+std::string Optics::Unused() const {
+  std::string s;
+  for (int i = 0; i < kMaxCam; i++)
+    if (cams_[i].valid && !cams_[i].use) s += (s.empty() ? "" : ", ") + std::to_string(i);
+  return s;
 }
 
 bool Optics::Ray(int cam, double x, double y, V3 &o, V3 &d) const {
@@ -2386,6 +2401,8 @@ bool Sync::SetCalibration(const std::string &json, std::string *err) {
   std::lock_guard<std::mutex> g(net_);
   if (!optics_.Load(json, err)) return false;
   have_optics_ = true;
+  std::string left_out = optics_.Unused();
+  if (!left_out.empty()) log_("cameras " + left_out + " left out: they look down, the base stations hang above");
   // a Quest's frame period is one of two, the Frame's is learned from its frames
   grid_quest_ = !optics_.exact_time() && !cfg_.learn_grid;
   grid_ = FrameGrid(grid_quest_);
@@ -2530,6 +2547,9 @@ void Sync::OnLine(double pc, const char *line) {
   long long tus;
   int mean, off = 0;
   if (sscanf(line, "F %d %u %lld %d %d%n", &cam, &k, &tus, &mean, &nb, &off) < 5) return;
+  // a calibrated camera left out (the Frame's lower pair, which looks at the floor): not worth a frame grid, cells or
+  // rays. An UNcalibrated camera isn't skipped -- the Quest's frame grid and timing still want its frames
+  if (have_optics_ && optics_.Skip(cam)) return;
   char xcls = 0;   // trailing class tag: 'L' or 'S' (lhsight2); absent on Quest (dots are short-frame)
   {
     const char *s = line + off;

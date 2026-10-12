@@ -109,8 +109,18 @@ constexpr double kBodyMoved = 2.0, kBodyCorr = 0.35;  // m, correlation -- the w
 double RotorPeriod(int channel);  // s, a 2.0 base station on channel 1..16, else 0
 
 // ---------------------------------------------------------------- optics
+// a camera whose optical axis (R's third column, in the device frame) climbs this much (of 1) looks up. This mirrors
+// upstream's Frame change (#38): the upper pair looks up, the lower pair looks down at the floor and the hands, and
+// upstream leaves the lower pair out because "only the two looking up ever matched a station". MEASURED ON OURS, that
+// is not true: all four cameras' bright rays converge on both base stations (~5.1 m apart), so the lower pair is not
+// junk -- the cut costs real station rays as well as junk. Kept because it also removes duplicate candidates (fewer
+// cross-camera fragments of one station) and that is what disambiguated the mirror. On a Quest every camera counts:
+// only LoadFrame sets `use`, so nothing is left out there
+constexpr double kUpward = 0.1;
+
 struct CamCal {
   bool valid = false;
+  bool use = true;   // looks where base stations hang (the Frame's two upper ones); all on a Quest
   int w = 0, h = 0;
   double ir = 1.0;  // near-IR laser image scale about the centre: kIR for the Quest side cameras
   M3 R;  // device <- camera
@@ -128,6 +138,9 @@ class Optics {
   bool Ray(int cam, double x, double y, V3 &o, V3 &d) const;  // device frame
   bool Pose(int cam, M3 &R, V3 &t) const;                     // device <- camera
   bool InImage(int cam, V3 dc, double margin) const;          // a camera-frame direction lands on the image
+  bool Used(int cam) const { return cam >= 0 && cam < kMaxCam && cams_[cam].valid && cams_[cam].use; }  // its sightings count
+  bool Skip(int cam) const { return cam >= 0 && cam < kMaxCam && cams_[cam].valid && !cams_[cam].use; }  // calibrated, left out
+  std::string Unused() const;  // "0, 1": the calibrated cameras left out, "" for none
   const std::string &device() const { return device_; }       // "Seacliff" (Quest Pro), "Eureka" (Quest 3), ...
   bool exact_time() const { return exact_time_; }  // frame times are the frames' own, no poll lag to take off
 
