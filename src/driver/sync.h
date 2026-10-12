@@ -98,13 +98,16 @@ constexpr double kJumpApply = 0.25;     // m: bigger corrections apply at once
 constexpr double kLevelSettle = 5.0, kLevelBody = 1.0;  // s, m
 // channel check (Solver::CheckIdentity): every kIdEvery s; a pair is swapped when its sightings follow each other's
 // rotor periods better by kSwapGain, and switched if the swapped alignment keeps kSwapFit of the support
-constexpr double kIdEvery = 10.0, kSwapGain = 0.10, kSwapFit = 0.7;
+constexpr double kIdEvery = 10.0, kSwapGain = 0.10, kNamed = 0.05, kSwapFit = 0.7;
+// layout check (Solver::CheckLayout), three or more stations: every kLayoutEvery s. A station the cameras see kMoved
+// or more off where SteamVR's map has it beside the others is logged
+constexpr double kLayoutEvery = 30.0;
 // the lighthouse devices worn or held tell two alignments apart (Solver::BodyFavours) when one puts them within
 // kBodyNear of the head and the other kBodyGap further
 constexpr double kBodyNear = 1.0, kBodyGap = 1.0;  // m
 // ... or their motion does (Sync::BodyMotion): when the head went kBodyMoved, and they follow it one way by kBodyCorr
 // and the other way not (a fit and its mirror move them opposite ways)
-constexpr double kBodyMoved = 2.0, kBodyCorr = 0.35;  // m, correlation -- the witness only speaks on a clear follow-the-head (measured +-0.24 must not decide a mirror)
+constexpr double kBodyMoved = 2.0, kBodyCorr = 0.2;  // m, correlation (upstream's value: a weak reading is caught by BodyFavours making motion and place agree, not by raising this)
 
 double RotorPeriod(int channel);  // s, a 2.0 base station on channel 1..16, else 0
 
@@ -262,6 +265,7 @@ class Frame {
   M3 Anchored() const { return f_.level * Cs_; }  // SteamVR's frame -> the reference frame, before gravity's tilt
   int ok() const { return ok_; }
   double deg() const { return deg_; }
+  void Reset();  // forgets the last update: the reference frame is new (Sync::ForceRecalibrate)
 
  private:
   const StationsFile &f_;
@@ -314,6 +318,7 @@ class Solver {
   using MotionFn = std::function<double(const X4 &, double &)>;
   void SetMotion(MotionFn f) { motion_ = std::move(f); }
   void Reset(const X4 &x);
+  void Clear();  // forgets the sightings, the alignment and what hung on them; the stations stay (Sync::ForceRecalibrate)
   // g: the frame's time on the headset's clock (NaN until the frame grid is known)
   void Add(double t, V3 o, V3 d, double g, int cam, bool bright);
   void Replace(double from, const std::vector<double> &T, const std::vector<V3> &O, const std::vector<V3> &D,
@@ -378,12 +383,13 @@ class Solver {
   std::set<std::string> stale_;
   bool has_x_ = false, has_anchor_ = false, has_acq_x_ = false;
   X4 x_{}, anchor_{}, acq_x_{};
-  double since_ = -1e18, brk_ = -1e18, last_acq_ = -1e18, seen_ = -1e18, last_id_ = -1e18;
+  double since_ = -1e18, brk_ = -1e18, last_acq_ = -1e18, seen_ = -1e18, last_id_ = -1e18, last_layout_ = -1e18;
   std::atomic<double> frame_p_{0};
   struct CamFrame { double t, g; int cam; V3 o; M3 R; };
   std::deque<CamFrame> frames_;
   std::function<bool(int, V3)> in_image_;
   std::string id_said_;
+  std::map<std::string, double> layout_said_;  // the layout check's stations logged, and how far off
   LogFn log_;
   std::mt19937_64 rng_;
   StepStat stat_;
@@ -422,6 +428,7 @@ class Solver {
   void CheckMirror(X4 &best, int &bs, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r, const Rays &t,
                    double now);
   void CheckIdentity(double now, const std::vector<std::string> &keys, const std::vector<V3> &S, const std::vector<V3> &Z);
+  void CheckLayout(const std::vector<std::string> &keys, const std::vector<V3> &S, const std::vector<V3> &Z);
 };
 
 // ---------------------------------------------------------------- timing
@@ -446,6 +453,7 @@ class Timing {
 // ---------------------------------------------------------------- the app
 struct SyncConfig {
   std::string dir;         // state files (stations.json, state.json)
+  bool per_headset = false;    // the driver: state.json per headset (Sync::SetHeadset); the tools keep it in dir
   bool arrival_clock = false;  // old logs: no round trips, fixed EXPO
   bool learn_timing = true;
   bool learn_grid = false;     // tools: learn the frame period even on a Quest Pro
@@ -472,6 +480,9 @@ class Sync {
   // from the driver's "upperCameras" setting, for A/B testing. Cells already made for the lower cameras stay until they
   // age out, so a session wants a fresh start to compare cleanly
   void SetUpperOnly(bool on);
+  // the headset this session talks to (its serial and model from its hello): state.json is kept per headset. Safe from
+  // any thread; Tick takes it up
+  void SetHeadset(const std::string &serial, const std::string &model);
   // 20 Hz; returns the transform for the lighthouse devices
   Transform Tick(double now);
   bool WillStep(double now) const { return now - last_step_ >= 1.0; }
@@ -482,6 +493,9 @@ class Sync {
   bool GravityFrame(M3 &C, M3 &turn, std::string &key);
   void SetGravity(bool on, const M3 &tilt) { frame_.SetGravity(on, tilt); }  // the driver's worker thread, as Tick
   void SetPaused(bool p) { paused_ = p; }
+  // forgets everything learned about the alignment and starts over: the sightings, the fit, the saved alignment and
+  // pose timing of this headset, and an automatic reference frame. Call from Tick's thread
+  void ForceRecalibrate();
   bool paused() const { return paused_; }
   // status
   struct Status {
@@ -607,6 +621,15 @@ class Sync {
   double BodyMotion(const X4 &x, double &moved);
 
   void LoadState();
+  // state.json lives in headsets/<model>-<serial hash>/ once the headset is known (before that, and for the tools,
+  // directly in dir); the one of earlier versions goes to the first headset that connects
+  std::string state_path_;
+  std::mutex hs_m_;
+  std::string hs_pending_, hs_key_;  // the headset SetHeadset named, Tick's current one
+  std::atomic<bool> hs_new_{false};
+  void ApplyHeadset();
+  void ApplyTiming();  // expo_ for the current streamer from timings_, the default if it has none (st_m_ held)
+  void ClearAlignment();
   void Retime(double old_e, double new_e);
   void LevelStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now);
   void LayoutStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now);
@@ -623,6 +646,6 @@ class Sync {
   std::map<std::string, StationsFile::Place> place_prior_;  // kept by earlier sessions
   std::map<std::string, int> place_off_;  // measurements in a row far off the kept place
   double last_place_ = 0, place_saved_ = -1e18;
-  void SaveState(const X4 &x, const std::map<std::string, V3> &cs);
+  void SaveState(const X4 &x, const std::map<std::string, V3> &cs, bool force = false);  // force: even if unmoved
   bool Seed(const std::map<std::string, V3> &raw, X4 &x, double &miss);
 };
