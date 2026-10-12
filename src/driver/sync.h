@@ -608,6 +608,13 @@ class Sync {
   // under net_: short frames waiting for their head pose (kPoseWait), in arrival order
   struct Spot { int x10, y10, npx, peak; };
   void MarkPresence(int cam, const M3 &R, double t, char cls, const std::vector<Spot> &bl);  // the class presence rings
+  // per camera per exposure class, what the cameras actually delivered: the first stage of the funnel.
+  // "frames" counts lines, "dots" counts the frames that carried a blob, "blobs" the blobs themselves
+  struct CamSpots { long fr[2] = {}, dots[2] = {}, blobs[2] = {}; int pk[2] = {}; };  // [0] long frames, [1] short
+  CamSpots camsp_[kMaxCam], camsp_last_[kMaxCam];
+  Spots stages_sp_;
+  double stages_t_ = 0;
+  void LogStages(double now);
   // the recent frames, for the projection test: a candidate is a PLACE, and a place is tested by
   // projecting it, not by keying a direction cell (which the station rolls across as the head moves)
   struct FRec { double t; int cam; char cls = 'L'; M3 R; V3 p; std::vector<Spot> bl; };

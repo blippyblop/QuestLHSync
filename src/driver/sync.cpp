@@ -3003,6 +3003,18 @@ void Sync::OnLine(double pc, const char *line) {
     }
   }
   nb = (int)bl.size();
+  // stage 1: collection. What each camera and class actually delivered, before any gate touches it.
+  if (cam >= 0 && cam < kMaxCam) {
+    CamSpots &cs = camsp_[cam];
+    int ci = (cls == 'S' ? 1 : 0);
+    cs.fr[ci]++;
+    if (nb) {
+      cs.dots[ci]++;
+      cs.blobs[ci] += nb;
+      for (const Spot &b : bl)
+        if (b.peak > cs.pk[ci]) cs.pk[ci] = b.peak;
+    }
+  }
   if (!solve) {
     // tagged-S dots are evidence, not rays: no grid, no solver. They are still queued, because the
     // class rings are marked from the frame's own pose like the long ones -- that pose is not known
@@ -3116,6 +3128,45 @@ void Sync::MarkPresence(int cam, const M3 &R, double t, char cls, const std::vec
       if (cl.ampL.size() > 64) cl.ampL.erase(cl.ampL.begin());
     }
   }
+}
+
+// Stage by stage, every 10 s: what the cameras delivered, what the gates kept, what the cells and the
+// candidate stage made of it. The funnel the whole detection rests on -- if a stage is empty the ones
+// after it cannot be right, and this is what says which.
+void Sync::LogStages(double now) {
+  if (now - stages_t_ < 10) return;
+  stages_t_ = now;
+  static const char *cn[2] = {"L", "S"};
+  std::string c;
+  for (int k = 0; k < kMaxCam; k++) {
+    for (int i = 0; i < 2; i++) {
+      long fr = camsp_[k].fr[i] - camsp_last_[k].fr[i], dt = camsp_[k].dots[i] - camsp_last_[k].dots[i];
+      long bl = camsp_[k].blobs[i] - camsp_last_[k].blobs[i];
+      if (!fr && !dt && !bl) continue;
+      c += Fmt("%sc%d%s %ldf %ldd %ldb pk%d", c.empty() ? "" : " | ", k, cn[i], fr, dt, bl, camsp_[k].pk[i]);
+    }
+    camsp_last_[k] = camsp_[k];
+  }
+  if (!c.empty()) log_("collect (frames/dots/blobs since last, peak): " + c);
+  Spots sp = spots();
+  long seen = sp.seen - stages_sp_.seen, used = sp.used - stages_sp_.used;
+  long cells = 0, tri = 0, fuzz = 0, cand = 0;
+  {
+    std::lock_guard<std::mutex> g(net_);
+    cells = (long)cells_.size();
+    for (auto &kv : cells_)
+      if (kv.second.tri) { tri++; if (kv.second.fuzzy) fuzz++; }
+    cand = (long)cands_.size();
+  }
+  if (seen || used) {
+    log_(Fmt("stages: %ld -> %ld dots -> %ld rays (%.0f%% of the dots arrive as a ray) | dropped: still %ld, fast %ld, big %ld, "
+             "nopose %ld, dim %ld, short %ld, S-gated %ld, fuzzy %ld, unmatched %ld | cells %ld (3D %ld, fuzzy %ld) -> candidates %ld",
+             sp.frames - stages_sp_.frames, seen, used, seen ? 100.0 * used / seen : 0.0, sp.still - stages_sp_.still,
+             sp.fast - stages_sp_.fast, sp.big - stages_sp_.big, sp.other - stages_sp_.other, sp.dim - stages_sp_.dim,
+             sp.sframe - stages_sp_.sframe, sp.cellskip - stages_sp_.cellskip, sp.fuzz - stages_sp_.fuzz,
+             sp.matchskip - stages_sp_.matchskip, cells, tri, fuzz, cand));
+  }
+  stages_sp_ = sp;
 }
 
 // The recent frames, for the projection test. A candidate is a 3D PLACE, and a place is tested by
@@ -4076,6 +4127,7 @@ Transform Sync::Tick(double now) {
       last_st_ = st;
       has_last_st_ = true;
     }
+    LogStages(now);
     // not acquired: what became of the cameras' bright spots, after a minute and then every 5
     if (Locked(solver_.has_x(), st)) sum_t_ = -1;
     else {
