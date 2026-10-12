@@ -55,18 +55,21 @@ def sum_collect(lines):
 
 
 def sum_stages(lines):
-    """the funnel counters, summed over intervals (the stages line is per-interval)."""
-    keys = ["frames", "dots", "rays", "still", "fast", "big", "nopose", "dim", "short", "sgated", "fuzzy", "unmatched"]
-    tot = {k: 0 for k in keys}
+    """The funnel counters, summed over intervals. Parsed generically ("name 1234") so the
+    labels can move in the driver's line without the report silently mis-labelling a stage."""
+    tot = {}
     for ln in lines:
-        m = re.search(r"(\d+) -> (\d+) dots -> (\d+) rays", ln)
+        m = re.search(r"(\d+) long frames -> (\d+) dots -> (\d+) rays", ln)
         if m:
-            tot["frames"] += int(m.group(1)); tot["dots"] += int(m.group(2)); tot["rays"] += int(m.group(3))
-        m = re.search(r"dropped: still (\d+), fast (\d+), big (\d+), nopose (\d+), dim (\d+), short (\d+), "
-                      r"S-gated (\d+), fuzzy (\d+), unmatched (\d+)", ln)
+            for k, v in zip(["frames", "dots", "rays"], m.groups()):
+                tot[k] = tot.get(k, 0) + int(v)
+        seg = ln.split("dropped:", 1)[-1].split("|", 1)[0]
+        for k, v in re.findall(r"(still|fast|big|nopose|dim|S-gated|fuzzy|unmatched) (\d+)", seg):
+            k = {"S-gated": "sgated"}.get(k, k)
+            tot[k] = tot.get(k, 0) + int(v)
+        m = re.search(r"\+(\d+) short-frame evidence dots", ln)
         if m:
-            for k, v in zip(["still", "fast", "big", "nopose", "dim", "short", "sgated", "fuzzy", "unmatched"], m.groups()):
-                tot[k] += int(v)
+            tot["short"] = tot.get("short", 0) + int(m.group(1))
     return tot
 
 
@@ -118,14 +121,16 @@ def main():
     print("=" * 100)
     s = sum_stages(d["stages"])
     if s["dots"]:
-        order = [("rays", "kept, became a ray"), ("short", "short-frame dots (evidence, not rays)"),
-                 ("big", "lamps or windows (too many pixels)"), ("dim", "dim (room too light to saturate)"),
-                 ("fast", "head turning too fast"), ("nopose", "no headset pose"),
-                 ("still", "headset still (lamps move too)"), ("sgated", "S-gate: steady sources"),
+        order = [("rays", "kept, became a ray"), ("big", "lamps or windows (too many pixels)"),
+                 ("dim", "dim (room too light to saturate)"), ("fast", "head turning too fast"),
+                 ("nopose", "no headset pose"), ("still", "headset still (lamps move too)"),
+                 ("sgated", "S-gate: steady sources (parked, on purpose)"),
                  ("fuzzy", "failed the 3D point test"), ("unmatched", "layout matcher did not accept")]
         for k, what in order:
-            print("  %8d  %5.1f%% of dots   %s" % (s[k], 100.0 * s[k] / s["dots"], what))
-        print("  --- %d dots from %d frames; %.0f%% arrive as a ray" % (s["dots"], s["frames"], 100.0 * s["rays"] / s["dots"]))
+            print("  %8d  %5.1f%% of the long dots   %s" % (s[k], 100.0 * s[k] / max(1, s["dots"]), what))
+        print("  --- %d long dots from %d frames; %.0f%% arrive as a ray"
+              % (s["dots"], s["frames"], 100.0 * s["rays"] / max(1, s["dots"])))
+        print("  --- %d short-frame dots, kept as evidence only (never rays by design)" % s["short"])
     else:
         print("  no stages lines")
 

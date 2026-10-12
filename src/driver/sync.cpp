@@ -3159,12 +3159,15 @@ void Sync::LogStages(double now) {
     cand = (long)cands_.size();
   }
   if (seen || used) {
-    log_(Fmt("stages: %ld -> %ld dots -> %ld rays (%.0f%% of the dots arrive as a ray) | dropped: still %ld, fast %ld, big %ld, "
-             "nopose %ld, dim %ld, short %ld, S-gated %ld, fuzzy %ld, unmatched %ld | cells %ld (3D %ld, fuzzy %ld) -> candidates %ld",
+    // "dots" is the LONG frames' blobs -- the only ones that can be a ray. The short frames' dots are
+    // counted separately (sp.sframe): they are evidence for the gate, never rays, so they must not sit
+    // in the denominator as if they had been dropped.
+    log_(Fmt("stages: %ld long frames -> %ld dots -> %ld rays (%.0f%%) | dropped: still %ld, fast %ld, big %ld, "
+             "nopose %ld, dim %ld, S-gated %ld, fuzzy %ld, unmatched %ld | +%ld short-frame evidence dots | cells %ld (3D %ld, fuzzy %ld) -> candidates %ld",
              sp.frames - stages_sp_.frames, seen, used, seen ? 100.0 * used / seen : 0.0, sp.still - stages_sp_.still,
              sp.fast - stages_sp_.fast, sp.big - stages_sp_.big, sp.other - stages_sp_.other, sp.dim - stages_sp_.dim,
-             sp.sframe - stages_sp_.sframe, sp.cellskip - stages_sp_.cellskip, sp.fuzz - stages_sp_.fuzz,
-             sp.matchskip - stages_sp_.matchskip, cells, tri, fuzz, cand));
+             sp.cellskip - stages_sp_.cellskip, sp.fuzz - stages_sp_.fuzz, sp.matchskip - stages_sp_.matchskip,
+             sp.sframe - stages_sp_.sframe, cells, tri, fuzz, cand));
   }
   stages_sp_ = sp;
 }
