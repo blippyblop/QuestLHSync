@@ -929,6 +929,27 @@ Solver::Rays Solver::GetRays(double t0) {
   return r;
 }
 
+// the sightings since t0: their frame-grid times, cameras and world directions (Sync names candidates with them)
+void Solver::SightingsSince(double t0, std::vector<double> &G, std::vector<int> &C, std::vector<V3> &O, std::vector<V3> &D) {
+  std::lock_guard<std::mutex> g(m_);
+  size_t j = std::lower_bound(rt_.begin(), rt_.end(), t0) - rt_.begin();
+  G.assign(rg_.begin() + j, rg_.end());
+  C.assign(rc_.begin() + j, rc_.end());
+  O.assign(ro_.begin() + j, ro_.end());
+  D.assign(rd_.begin() + j, rd_.end());
+}
+
+// the camera frames since t0: which camera, its grid time, and its origin and rotation in the world (the in-view test)
+void Solver::FramesSince(double t0, std::vector<int> &C, std::vector<double> &G, std::vector<V3> &O, std::vector<M3> &R) {
+  std::lock_guard<std::mutex> g(m_);
+  C.clear();
+  G.clear();
+  O.clear();
+  R.clear();
+  for (auto &f : frames_)
+    if (f.t >= t0) { C.push_back(f.cam); G.push_back(f.g); O.push_back(f.o); R.push_back(f.R); }
+}
+
 void Solver::Stations(std::vector<std::string> &keys, std::vector<V3> &S, std::vector<V3> &Z) const {
   std::lock_guard<std::mutex> g(m_);
   keys.clear(); S.clear(); Z.clear();
@@ -1165,7 +1186,8 @@ static bool Solve(double A[kMaxDof][kMaxDof], const double *b, double *x, int n)
 // nothing by looking longer. xa: the prior's center (default x0). cond: the sightings alone pin every DOF.
 // 4 DOF; with a pivot 6: the stations also tilt about it (Tilt(y[4], y[5])), and the prior holds only the tilt.
 Solver::FitR Solver::Fit(const X4 &x0, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r, double now,
-                         double gate, const X4 *xa_in, const V3 *pivot, double dim_gate, const V3 *axis) {
+                         double gate, const X4 *xa_in, const V3 *pivot, double dim_gate, const V3 *axis,
+                         const std::vector<int> *who) {
   FitR out;
   std::vector<V3> P, Zq;
   Predict(x0, S, Z, P, Zq);
@@ -1174,6 +1196,14 @@ Solver::FitR Solver::Fit(const X4 &x0, const std::vector<V3> &S, const std::vect
   int m = 0;
   for (size_t n = 0; n < r.size(); n++) {
     double a;
+    // who: the station is TOLD (naming by rotor timing), so there is no gate to pass -- a sighting the
+    // naming left out (-1) is dropped. Without who, the nearest station within the gate, as before.
+    if (who) {
+      if ((*who)[n] < 0) continue;
+      kk[n] = (*who)[n];
+      use[n] = 1; m++;
+      continue;
+    }
     Nearest(P, Zq, r.O[n], r.D[n], kk[n], a);
     if (a < (r.B.empty() || r.B[n] ? gate : std::min(gate, dim_gate))) { use[n] = 1; m++; }
   }
@@ -2917,11 +2947,17 @@ void Sync::OnLine(double pc, const char *line) {
   // a calibrated camera left out (the Frame's lower pair, which looks at the floor): not worth a frame grid, cells or
   // rays. An UNcalibrated camera isn't skipped -- the Quest's frame grid and timing still want its frames
   if (have_optics_ && optics_.Skip(cam)) return;
-  char xcls = 0;   // trailing class tag: 'L' or 'S' (lhsight2); absent on Quest (dots are short-frame)
+  // the class tag is LAST on the line ("... [x y npx peak]... L|S"), after the blobs -- not right after nb. Reading it
+  // from just past nb only matched blob-less lines, so every line with dots was classed 'S': both classes then went
+  // into the frame grid (its period could never fold: 49 frames/s measured), the L dots marked seqS, and seqL stayed
+  // empty -- which also left the dot marks off both rings (the marking needs both non-empty). That is why the
+  // presence rings read all-zero and the S-gate and the channel check were dead. Tags are one letter: take the last
+  // token if it is exactly that and preceded by a space (a Quest's line ends on a blob's peak, a digit).
+  char xcls = 0;
   {
-    const char *s = line + off;
-    while (*s == ' ') s++;
-    if (s[0] && !s[1] && (s[0] == 'L' || s[0] == 'S')) xcls = s[0];
+    size_t L = strlen(line);
+    while (L && line[L - 1] == ' ') L--;
+    if (L >= 2 && line[L - 2] == ' ' && (line[L - 1] == 'L' || line[L - 1] == 'S')) xcls = line[L - 1];
   }
   std::lock_guard<std::mutex> g(net_);
   nframes_++;
@@ -3279,6 +3315,80 @@ void Sync::CellsSweep(double t) {
     for (uint64_t k : ci->keys) cells_[k].mains = mains;
     if (mains) ci = cands_.erase(ci);
     else ++ci;
+  }
+  // NAMING, diagnostic only (no decision hangs on it yet). A 2.0 base station's rotors sweep at a fixed period, so
+  // the frames that see one station's dot modulate at ITS channel; matching a candidate's sighting train to the known
+  // channel periods names it. Upstream names stations only after a lock (CheckIdentity); naming the CANDIDATE is what
+  // would let acquisition tell one station from the other -- i.e. kill a mirror without the worn or held devices. The
+  // train is built the way upstream's CheckLayout builds it: the frames a direction was in view of, and which of them
+  // saw it (a sighting whose world direction keys to this cell). Everything is accumulated from what has arrived.
+  if (!cands_.empty()) {
+    std::map<std::string, int> ch;
+    {
+      std::lock_guard<std::mutex> g(raw_m_);
+      ch = channels_;
+    }
+    std::vector<double> tau;
+    std::vector<std::string> cn;
+    for (auto &kv : ch) {
+      double p = RotorPeriod(kv.second);
+      if (p > 0) { tau.push_back(p); cn.push_back(kv.first); }
+    }
+    if (!tau.empty()) {
+      // the train is built about the candidate's PLACE, not its direction cell (upstream's CheckLayout): a train keyed
+      // to a 2.4 deg cell is chopped up by the head sweeping the dot across cell borders, which buries the modulation.
+      // A frame sees the place if it lands in that camera's image facing it; a sighting counts for it if the ray passes
+      // within kNameNear of it, and its frame is the one that saw the dot.
+      std::vector<double> G;
+      std::vector<int> C;
+      std::vector<V3> O, D;
+      solver_.SightingsSince(t - 120.0, G, C, O, D);
+      std::vector<int> fc;
+      std::vector<double> fg;
+      std::vector<V3> fo;
+      std::vector<M3> fR;
+      solver_.FramesSince(t - 120.0, fc, fg, fo, fR);
+      const double kNameNear = 1.0;   // deg: a ray this close to the place saw it
+      if (!(grid_.period(cands_[0].cam) > 0))
+        log_(Fmt("candidate naming: no frame period learned for cam %d yet: a train has no clock to sit on", cands_[0].cam));
+      for (size_t i = 0; i < cands_.size() && i < 8; i++) {
+        const Cand &cd = cands_[i];
+        double P = grid_.period(cd.cam);
+        if (!(P > 0)) continue;
+        std::set<std::pair<int, double>> sw;
+        for (size_t n = 0; n < G.size(); n++) {
+          V3 w = cd.q - O[n];
+          double d = norm(w);
+          if (d < 0.4) continue;
+          if (std::acos(std::max(-1.0, std::min(1.0, dot(w, D[n]) / d))) * kDeg < kNameNear) sw.insert({C[n], G[n]});
+        }
+        std::vector<InView> v;
+        for (size_t n = 0; n < fc.size(); n++) {
+          if (fc[n] != cd.cam || !std::isfinite(fg[n])) continue;
+          V3 U = cd.q - fo[n];
+          double d = norm(U);
+          if (!(d > 0.3) || !(dot(U, fR[n] * V3{0, 0, 1}) >= 0.2 * d)) continue;   // facing it
+          // net_ is already held: CellsSweep runs from Use, which OnLine calls under it (do NOT re-lock)
+          if (!(have_optics_ && optics_.InImage(fc[n], T(fR[n]) * (U * (1 / d)), 8.0))) continue;
+          v.push_back({fc[n], fg[n], sw.count({fc[n], fg[n]}) > 0});
+        }
+        int seen = 0;
+        for (auto &e : v) seen += e.seen;
+        std::vector<double> sc;
+        if (!SeenScores(v, tau, P, sc)) {
+          log_(Fmt("candidate naming: q[%.1f %.1f %.1f] seen %ld: not enough of a train (%d frames, %d seen, period %.1f ms)",
+                   cd.q.x, cd.q.y, cd.q.z, cd.seen, (int)v.size(), seen, P * 1000));
+          continue;
+        }
+        int b = (int)(std::max_element(sc.begin(), sc.end()) - sc.begin());
+        double other = 0;
+        for (size_t j = 0; j < sc.size(); j++)
+          if ((int)j != b) other = std::max(other, sc[j]);
+        bool clear = sc[b] - other >= kNamed;
+        log_(Fmt("candidate naming: q[%.1f %.1f %.1f] seen %ld: %s (%.3f, next %.3f) on %d frames, %d seen",
+                 cd.q.x, cd.q.y, cd.q.z, cd.seen, clear ? cn[b].c_str() : "no channel", sc[b], other, (int)v.size(), seen));
+      }
+    }
   }
   if (watched > 0 && best_seen > 0)
     log_(Fmt("cameras: %ld presence checks, highest %.0f%% (%ld/%ld), %ld judged steady -- a real station sits near 70-85%%",

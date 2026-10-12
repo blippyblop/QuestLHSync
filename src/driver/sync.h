@@ -340,6 +340,10 @@ class Solver {
   int ScoreX(const X4 &x, double gate);   // rays within gate (DEGREES) of any predicted station direction (acquisition enumeration)
   // witness: do the lighthouse devices worn or held favour a or b? 1 a, 2 b, 0 no evidence (the enumeration's mirror test)
   int WitnessFavours(const X4 &a, const X4 &b, double &da, double &db, std::string &how) const { return BodyFavours(a, b, da, db, how); }
+  // evidence tools (Sync names candidates by rotor timing before a lock): the sightings and the camera frames since t0,
+  // copied out -- the solver owns both and naming a candidate needs each side
+  void SightingsSince(double t0, std::vector<double> &G, std::vector<int> &C, std::vector<V3> &O, std::vector<V3> &D);
+  void FramesSince(double t0, std::vector<int> &C, std::vector<double> &G, std::vector<V3> &O, std::vector<M3> &R);
   bool starved() const { return starved_; }
   int resets() const { return resets_; }  // stations (sorted by serial) as the solver uses them
   void Stations(std::vector<std::string> &keys, std::vector<V3> &S, std::vector<V3> &Z) const;
@@ -412,7 +416,8 @@ class Solver {
   // pivot: also fit a tilt of the stations about it (6 DOF), returned in FitR::tilt; with axis (horizontal, unit),
   // only about that axis (5 DOF, FitR::theta too). dim_gate: the gate for rays dimmer than kBright, when narrower
   FitR Fit(const X4 &x0, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r, double now, double gate,
-           const X4 *xa, const V3 *pivot = nullptr, double dim_gate = 180, const V3 *axis = nullptr);
+           const X4 *xa, const V3 *pivot = nullptr, double dim_gate = 180, const V3 *axis = nullptr,
+           const std::vector<int> *who = nullptr);  // who: each sighting's station as told (-1: left out), no gate
   void Hypotheses(const Rays &r, const std::vector<V3> &S, std::vector<X4> &H, int M = 4000);
   void BatchSupport(const std::vector<X4> &H, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r,
                     const std::vector<int> &idx, double gate, std::vector<int> &out) const;
