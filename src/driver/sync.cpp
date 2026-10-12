@@ -3310,12 +3310,18 @@ void Sync::CellsSweep(double t) {
   // starburst members, so a lamp dies WHOLE -- before, arms with thin rings could keep a gated
   // core's family alive. Mains candidates are removed from the matcher's list entirely and their
   // member cells carry the verdict to the ray gate in Use.
+  int dropped_mains = 0;
   for (auto ci = cands_.begin(); ci != cands_.end();) {
     bool mains = ci->sf >= 8 && (double)ci->sh / ci->sf >= 0.15;
     for (uint64_t k : ci->keys) cells_[k].mains = mains;
-    if (mains) ci = cands_.erase(ci);
+    if (mains) { ci = cands_.erase(ci); dropped_mains++; }
     else ++ci;
   }
+  // the S-gate's own activity: it is only live if the class rings are real (the tag parse bug left seqS empty of 1s,
+  // so nothing was ever dropped and the gate read as "working" while doing nothing)
+  if (dropped_mains)
+    log_(Fmt("S-gate: %d candidate(s) dropped as steady sources (seen on 8+ short frames, %.0f%%+ short-presence)",
+             dropped_mains, 15.0));
   // NAMING, diagnostic only (no decision hangs on it yet). A 2.0 base station's rotors sweep at a fixed period, so
   // the frames that see one station's dot modulate at ITS channel; matching a candidate's sighting train to the known
   // channel periods names it. Upstream names stations only after a lock (CheckIdentity); naming the CANDIDATE is what
@@ -3385,8 +3391,11 @@ void Sync::CellsSweep(double t) {
         for (size_t j = 0; j < sc.size(); j++)
           if ((int)j != b) other = std::max(other, sc[j]);
         bool clear = sc[b] - other >= kNamed;
-        log_(Fmt("candidate naming: q[%.1f %.1f %.1f] seen %ld: %s (%.3f, next %.3f) on %d frames, %d seen",
-                 cd.q.x, cd.q.y, cd.q.z, cd.seen, clear ? cn[b].c_str() : "no channel", sc[b], other, (int)v.size(), seen));
+        int l1 = 0;
+        for (uint8_t e : cd.ring) l1 += e;
+        log_(Fmt("candidate naming: q[%.1f %.1f %.1f] seen %ld: %s (%.3f, next %.3f) on %d frames, %d seen; L %d/%zu S %d/%d",
+                 cd.q.x, cd.q.y, cd.q.z, cd.seen, clear ? cn[b].c_str() : "no channel", sc[b], other, (int)v.size(), seen,
+                 l1, cd.ring.size(), cd.sh, cd.sf));
       }
     }
   }
