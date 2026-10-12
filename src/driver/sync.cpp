@@ -3162,10 +3162,10 @@ void Sync::LogStages(double now) {
     // "dots" is the LONG frames' blobs -- the only ones that can be a ray. The short frames' dots are
     // counted separately (sp.sframe): they are evidence for the gate, never rays, so they must not sit
     // in the denominator as if they had been dropped.
-    log_(Fmt("stages: %ld long frames -> %ld dots -> %ld rays (%.0f%%) | dropped: still %ld, fast %ld, big %ld, "
+    log_(Fmt("stages: %ld long frames -> %ld dots -> %ld rays (%.0f%%) | dropped: still %ld, fast %ld, big %ld (kept big %ld), "
              "nopose %ld, dim %ld, S-gated %ld, fuzzy %ld, unmatched %ld | +%ld short-frame evidence dots | cells %ld (3D %ld, fuzzy %ld) -> candidates %ld",
              sp.frames - stages_sp_.frames, seen, used, seen ? 100.0 * used / seen : 0.0, sp.still - stages_sp_.still,
-             sp.fast - stages_sp_.fast, sp.big - stages_sp_.big, sp.other - stages_sp_.other, sp.dim - stages_sp_.dim,
+             sp.fast - stages_sp_.fast, sp.big - stages_sp_.big, sp.bigkeep - stages_sp_.bigkeep, sp.other - stages_sp_.other, sp.dim - stages_sp_.dim,
              sp.cellskip - stages_sp_.cellskip, sp.fuzz - stages_sp_.fuzz, sp.matchskip - stages_sp_.matchskip,
              sp.sframe - stages_sp_.sframe, cells, tri, fuzz, cand));
   }
@@ -3687,7 +3687,22 @@ void Sync::Use(const Shot &f) {
   if (f.cls == 'S') {   // evidence only: the short frames mark the class rings and carry no rays
     spots_.sframe += nb;
     if (have_pose) {
-      if (optics_.exact_time()) MarkPresence(cam, R, t, 'S', bl);
+      if (optics_.exact_time()) {
+        MarkPresence(cam, R, t, 'S', bl);
+        // ... and their FOOTPRINT per direction. In a ~0.3 ms exposure a source that radiates
+        // continuously is still extended (a lamp, a window) while a laser's speck is a dot, so this
+        // is the one size test that the long exposure's bloom cannot corrupt. Never creates a cell:
+        // a short-frame flash on its own is not a light we have located.
+        for (const Spot &b : bl) {
+          V3 o, d;
+          if (!optics_.Ray(cam, b.x10 / 10.0 - 0.5, b.y10 / 10.0 - 0.5, o, d)) continue;
+          auto it = cells_.find(CellKey(cam, R * d));
+          if (it == cells_.end()) continue;
+          SpotCell &cl = it->second;
+          cl.sn++;
+          cl.snpx = b.npx > cl.snpx ? (float)b.npx : cl.snpx * 0.95f;  // decaying max: stop being extended, forget it
+        }
+      }
       Remember(t, cam, 'S', R, p, bl);
     }
     return;
@@ -3719,9 +3734,19 @@ void Sync::Use(const Shot &f) {
   if (have_lag && w <= kWmax && optics_.Pose(cam, Rc, tc)) solver_.AddFrame(t, hg, cam, p + R * tc, R * Rc);
   for (const Spot &b : bl) {
     int x10 = b.x10, y10 = b.y10, npx = b.npx;
-    if (npx > kMaxPx) { spots_.big++; continue; }
     V3 o, d;
     if (!optics_.Ray(cam, x10 / 10.0 - 0.5, y10 / 10.0 - 0.5, o, d)) { spots_.other++; continue; }
+    if (npx > kMaxPx) {
+      // A long exposure blooms a source to hundreds or thousands of pixels (measured 50-150x against
+      // the short frame, at the same pixel), so size on THIS class does not tell a station from a
+      // lamp -- and dropping on it deleted the sources. Keep the blob, and veto only when the SHORT
+      // frame shows the same direction extended too, i.e. it radiates continuously. The rotor beat
+      // (ampL) and the S/L contrast then carry the lamp-versus-station decision, as intended.
+      if (!optics_.exact_time()) { spots_.big++; continue; }  // Quest: the size filter still stands
+      auto it = cells_.find(CellKey(cam, R * d));
+      if (it != cells_.end() && it->second.sn >= kShortN && it->second.snpx >= kShortBig) { spots_.big++; continue; }
+      spots_.bigkeep++;
+    }
     if (g_ray_dump) {
       V3 O = p + R * o, D = R * d;
       fprintf(g_ray_dump, "R %.6f %d %.6f %.6f %.6f %.7f %.7f %.7f %.6f %.6f %.6f %.1f %d\n", t, cam, O.x, O.y, O.z, D.x,
@@ -3777,7 +3802,8 @@ std::string Sync::Describe(const Spots &a, const Spots &b) {
   auto part = [&](long k, const char *what) { if (k > 0) why += Fmt("%s%ld %s", why.empty() ? "" : ", ", k, what); };
   part(b.still - a.still, "while the headset was still");
   part(b.fast - a.fast, "while it turned fast");
-  part(b.big - a.big, "lamps or windows");
+  part(b.big - a.big, "lamps or windows (extended on the short frames too)");
+  part(b.bigkeep - a.bigkeep, "kept though big: compact on the short frames, so a source");
   part(b.other - a.other, "without a headset pose");
   part(b.dim - a.dim, "dim, kept for a room too light for the dots to saturate");
   part(b.cellskip - a.cellskip, "directions also lit on short frames (lamps, steady IR)");

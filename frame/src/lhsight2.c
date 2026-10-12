@@ -611,6 +611,33 @@ static int track_modulated(const struct track *tr) {
   return present >= 2 && n-lo >= 4 && mx - mn >= 64;
 }
 
+/* Diagnostic: dump the frames the collector actually sees, in the state it analyses them in --
+ * de-strided into scratch, after the torn-frame test, with the class it was assigned. This is the
+ * pipeline's input, verbatim: if these look wrong, nothing downstream can be right. Off unless
+ * LHSIGHT2_DUMP names a directory.
+ *   LHSIGHT2_DUMP=<dir> LHSIGHT2_DUMPN=<per camera per class, default 12>
+ * Writes P5 PGM (raw 8-bit), which gzips well because these are mostly dark. */
+static const char *dump_dir;
+static int dump_n = 12, dump_got[NCAM][2];
+static double dump_last[NCAM][2];
+static void dump_frame(int k, const u8 *img, int w, int h, char cls, unsigned seq, int mean, int rmax) {
+  if (!dump_dir) return;
+  int ci = cls == 'S' ? 1 : 0;
+  if (dump_got[k][ci] >= dump_n) return;
+  double t = now_s(CLOCK_MONOTONIC);
+  if (dump_last[k][ci] && t - dump_last[k][ci] < 0.4) return;  // spread the samples over time, not one burst
+  dump_last[k][ci] = t;
+  char p[300];
+  snprintf(p, sizeof p, "%s/cam%d_%c_%05u.pgm", dump_dir, k, cls, seq);
+  FILE *f = fopen(p, "wb");
+  if (!f) return;
+  fprintf(f, "P5\n%d %d\n255\n", w, h);
+  fwrite(img, 1, (size_t)w * h, f);
+  fclose(f);
+  dump_got[k][ci]++;
+  out("D cam%d %c seq %u mean %d rmax %d -> %s", k, cls, seq, mean, rmax, p);
+}
+
 static void frame(int k, int i, const struct v4l2_buffer *b) {
   struct cam *c = &C[k];
   double ts = b->timestamp.tv_sec + b->timestamp.tv_usec/1e6;
@@ -644,6 +671,7 @@ static void frame(int k, int i, const struct v4l2_buffer *b) {
   for (int y = 0; y < c->h; y++) memcpy(scratch + (size_t)y*c->w, p + (size_t)y*c->stride, c->w);
   cpu_access(c->fd[i], 1);
   if (torn(c, i, b)) return;
+  dump_frame(k, scratch, c->w, c->h, cls, b->sequence, mean, c->rmax);   // LHSIGHT2_DUMP: the exact input
   u64 sx[MAXB], sy[MAXB]; u32 np[MAXB]; int pk[MAXB]; u32 sat[MAXB];
   int T = mean*4/10; if (T < 64) T = 64;
   int nc = (c->w>>4)*(c->h>>4);
@@ -684,6 +712,8 @@ static double due(const struct cam *c, double t) {
 int lhsight_main(void) {
   const char *runenv = getenv("LHSIGHT2_RUN");
   double run = runenv ? atof(runenv) : 0.0;   /* 0 = forever (the service) */
+  dump_dir = getenv("LHSIGHT2_DUMP");         /* diagnostic: dump what the detector is fed */
+  { const char *dn = getenv("LHSIGHT2_DUMPN"); if (dn) dump_n = atoi(dn); }
   double t_start = now_s(CLOCK_MONOTONIC);
   pid_t xr = xrservice_pid();
   if (!xr) { out("E XRService isn't running"); return 2; }
@@ -723,3 +753,11 @@ int lhsight_main(void) {
     if (wake > t) usleep((useconds_t)((wake-t)*1e6));
   }
 }
+
+#ifdef LHSIGHT2_MAIN
+/* Diagnostic build: the same sensor with the same capture path, but its own main(), so what it
+ * prints lands on the terminal instead of in the pipe to lhsyncd. For dumping the detector's input:
+ *   zig cc -target aarch64-linux-gnu -DLHSIGHT2_MAIN -O2 lhsight2.c -lm -o lhsight_dump
+ *   LHSIGHT2_RUN=25 LHSIGHT2_DUMP=/tmp/qlhsdump LHSIGHT2_DUMPN=12 ./lhsight_dump */
+int main(void) { return lhsight_main(); }
+#endif
