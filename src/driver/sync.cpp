@@ -2994,12 +2994,27 @@ void Sync::OnLine(double pc, const char *line) {
   bool solve = !xcls || xcls == 'L';               // untagged lines are stock Quest semantics: dots are rays
   std::vector<Spot> bl;
   {
+    // how many numbers per blob: the Frame sends 8 (x10 y10 npx peak sat flux w h), recordings from
+    // before that send 4. nb is on the line, so counting the remaining tokens settles it exactly --
+    // guessing per-blob would let an 8-wide read swallow two 4-wide records.
+    int per = 4, ntok = 0;
+    {
+      bool in = false;
+      for (const char *q = line + off; *q; q++) {
+        if (*q == ' ') in = false;
+        else if (!in) in = true, ntok++;
+      }
+      if (xcls) ntok--;   // the class letter is the last token
+      if (nb > 0 && ntok == nb * 8) per = 8;
+    }
     const char *s = line + off;
     for (int i = 0; i < nb; i++) {
-      int x10, y10, npx, peak, used = 0;
-      if (sscanf(s, " %d %d %d %d%n", &x10, &y10, &npx, &peak, &used) < 4) break;
+      int x10, y10, npx, peak, sat = 0, fl = 0, bw = 0, bh = 0, used = 0;
+      int got = per == 8 ? sscanf(s, " %d %d %d %d %d %d %d %d%n", &x10, &y10, &npx, &peak, &sat, &fl, &bw, &bh, &used)
+                         : sscanf(s, " %d %d %d %d%n", &x10, &y10, &npx, &peak, &used);
+      if (got < 4) break;
       s += used;
-      bl.push_back({x10, y10, npx, peak});
+      bl.push_back({x10, y10, npx, peak, sat, fl, bw, bh});
     }
   }
   nb = (int)bl.size();
@@ -3011,8 +3026,12 @@ void Sync::OnLine(double pc, const char *line) {
     if (nb) {
       cs.dots[ci]++;
       cs.blobs[ci] += nb;
-      for (const Spot &b : bl)
+      for (const Spot &b : bl) {
         if (b.peak > cs.pk[ci]) cs.pk[ci] = b.peak;
+        int f = b.sum ? b.sum : b.npx * b.peak;
+        cs.fl[ci] += f;
+        if (f > cs.flmax[ci]) cs.flmax[ci] = f;
+      }
     }
   }
   if (!solve) {
@@ -3097,16 +3116,27 @@ void Sync::CellSeen(int cam, const V3 &w, float peak, double t) {
 //    That is 56-67% of frames where the direction is really on the image only 27-40% of the time,
 //    so every cell collected ~2x too many zeros. InImage is the honest test.
 // The two together read a base station's own cell at ~4%; its real rate is 22-40% (L) and 5-7% (S).
+// The amplitude ring is one byte per frame and the flux spans roughly 1e2..1e6 (a bloomed blob is
+// thousands of saturated pixels), so compress it logarithmically -- the beat is a RELATIVE
+// modulation, and 8 levels per doubling keeps ~0.4 dB of resolution across the whole range.
+static uint8_t AmpFlux(int npx, int peak, int sum) {
+  uint32_t f = sum ? (uint32_t)sum : (uint32_t)npx * (uint32_t)peak;  // old recordings: approximate
+  if (!f) return 0;
+  int a = 0;
+  while (f > 32 && a < 255) { f >>= 1; a += 8; }
+  return (uint8_t)a;
+}
+
 void Sync::MarkPresence(int cam, const M3 &R, double t, char cls, const std::vector<Spot> &bl) {
   (void)t;
   M3 Rc; V3 tc;
   if (!optics_.Pose(cam, Rc, tc)) return;
-  // the cells this frame's blobs land in (key -> the brightest peak, for the amplitude ring)
+  // the cells this frame's blobs land in (key -> the brightest FLUX, for the amplitude ring)
   std::vector<std::pair<uint64_t, int>> hit;
   for (const Spot &b : bl) {
     V3 o, d;
     if (!optics_.Ray(cam, b.x10 / 10.0 - 0.5, b.y10 / 10.0 - 0.5, o, d)) continue;
-    hit.push_back({CellKey(cam, R * d), b.peak});
+    hit.push_back({CellKey(cam, R * d), AmpFlux(b.npx, b.peak, b.sum)});
   }
   const M3 Rt = T(R), Rct = T(Rc);
   for (uint64_t ak : actk_[cam]) {
@@ -3143,7 +3173,8 @@ void Sync::LogStages(double now) {
       long fr = camsp_[k].fr[i] - camsp_last_[k].fr[i], dt = camsp_[k].dots[i] - camsp_last_[k].dots[i];
       long bl = camsp_[k].blobs[i] - camsp_last_[k].blobs[i];
       if (!fr && !dt && !bl) continue;
-      c += Fmt("%sc%d%s %ldf %ldd %ldb pk%d", c.empty() ? "" : " | ", k, cn[i], fr, dt, bl, camsp_[k].pk[i]);
+      c += Fmt("%sc%d%s %ldf %ldd %ldb pk%d fl~%ld max%d", c.empty() ? "" : " | ", k, cn[i], fr, dt, bl, camsp_[k].pk[i],
+             dt ? camsp_[k].fl[i] / dt : 0, camsp_[k].flmax[i]);
     }
     camsp_last_[k] = camsp_[k];
   }
@@ -3359,6 +3390,7 @@ void Sync::CellsSweep(double t) {
       cd.keys = {it->first};
       cd.sh = sh; cd.sf = (int)cl.seqS.size();
       cd.dir = Unit(cl.w); cd.dir0 = Unit(cl.w0); cd.cam = cl.cam; cd.trav = cl.trav; cd.ring = cl.seqL;
+      cd.snpx = cl.snpx; cd.sn = cl.sn;
       raw.push_back(std::move(cd));
     }
     if (cl.vis >= 60 && cl.seen >= 16) {      watched++;
@@ -3427,6 +3459,7 @@ void Sync::CellsSweep(double t) {
       if (c.beat > m.beat) m.beat = c.beat;
       m.beatm = m.beatm || c.beatm;
       if (c.seen > m.seen) m.seen = c.seen;
+      m.snpx = std::max(m.snpx, c.snpx); m.sn += c.sn;
       m.sh += c.sh;
       m.sf += c.sf;
       m.pl += c.pl; m.pln += c.pln; m.ps += c.ps; m.psn += c.psn;
@@ -3536,9 +3569,10 @@ void Sync::CellsSweep(double t) {
         bool clear = sc[b] - other >= kNamed;
         int l1 = 0;
         for (uint8_t e : cd.ring) l1 += e;
-        log_(Fmt("candidate naming: q[%.1f %.1f %.1f] seen %ld: %s (%.3f, next %.3f) on %d frames, %d seen; L %d/%zu S %d/%d; proj L %d/%d S %d/%d",
+        log_(Fmt("candidate naming: q[%.1f %.1f %.1f] seen %ld: %s (%.3f, next %.3f) on %d frames, %d seen; L %d/%zu S %d/%d; "
+                 "proj L %d/%d S %d/%d; short footprint %.0f px on %d",
                  cd.q.x, cd.q.y, cd.q.z, cd.seen, clear ? cn[b].c_str() : "no channel", sc[b], other, (int)v.size(), seen,
-                 l1, cd.ring.size(), cd.sh, cd.sf, cd.pl, cd.pln, cd.ps, cd.psn));
+                 l1, cd.ring.size(), cd.sh, cd.sf, cd.pl, cd.pln, cd.ps, cd.psn, cd.snpx, cd.sn));
       }
     }
   }

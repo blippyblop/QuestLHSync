@@ -556,7 +556,8 @@ class Sync {
   // showed C cannot be trusted as a tolerance.
   struct Cand { V3 q; float res; long seen; uint64_t key; float beat = 0; bool beatm = false; std::vector<uint64_t> keys; int sh = 0, sf = 0;
                 V3 dir, dir0; int cam = -1; bool trav = false; bool mains = false; std::vector<uint8_t> ring;
-                int pl = 0, pln = 0, ps = 0, psn = 0; };  // projection presence: long/short hits over the frames the place was in image  // angular merge: direction now/first, camera, head traveled, L presence ring; beatm = the beat score was measurable (a short ring scores 0, which is "unknown", not "flat")
+                int pl = 0, pln = 0, ps = 0, psn = 0;
+                float snpx = 0; int sn = 0; };  // the SHORT frames' footprint here: a dot stays a dot in 0.3 ms, an extended source does not  // projection presence: long/short hits over the frames the place was in image  // angular merge: direction now/first, camera, head traveled, L presence ring; beatm = the beat score was measurable (a short ring scores 0, which is "unknown", not "flat")
   std::vector<Cand> cands_;   // rebuilt every CellsSweep
   struct MatchReport { bool ok = false; int npass = 0, a0 = 0, a1 = 0; double best = 0, second = 0, margin = 0; };
   MatchReport MatchLayout(const V3 *P, int n);
@@ -619,11 +620,17 @@ class Sync {
   std::map<int, std::vector<std::pair<double, double>>> prev_big_;  // under net_: each camera's last steady lights
   long img_moved_ = 0, img_still_ = 0;  // under net_: of those, while SteamVR's headset stands still
   // under net_: short frames waiting for their head pose (kPoseWait), in arrival order
-  struct Spot { int x10, y10, npx, peak; };
+  // A blob as the Frame reports it. x10/y10: the centroid in tenths of a pixel. npx: pixels.
+  // peak: the brightest pixel. sat: pixels at the top level (a saturated CORE, which a bloomed dot
+  // need not have). sum: the FLUX, the sum of the pixels -- the only amplitude that does not peg at
+  // 255 the moment a dot saturates, which on these cameras the peak does on essentially every dot,
+  // so the rotor beat had no depth to find. w/h: the bounding box, so a round speck can be told from
+  // a streak or a rectangle. The last four are new: an older recording parses with them zero.
+  struct Spot { int x10, y10, npx, peak; int sat = 0, sum = 0, w = 0, h = 0; };
   void MarkPresence(int cam, const M3 &R, double t, char cls, const std::vector<Spot> &bl);  // the class presence rings
   // per camera per exposure class, what the cameras actually delivered: the first stage of the funnel.
   // "frames" counts lines, "dots" counts the frames that carried a blob, "blobs" the blobs themselves
-  struct CamSpots { long fr[2] = {}, dots[2] = {}, blobs[2] = {}; int pk[2] = {}; };  // [0] long frames, [1] short
+  struct CamSpots { long fr[2] = {}, dots[2] = {}, blobs[2] = {}; int pk[2] = {}; long fl[2] = {}; int flmax[2] = {}; };  // [0] long, [1] short
   CamSpots camsp_[kMaxCam], camsp_last_[kMaxCam];
   Spots stages_sp_;
   double stages_t_ = 0;

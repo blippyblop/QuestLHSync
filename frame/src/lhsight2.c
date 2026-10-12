@@ -290,7 +290,12 @@ static int smean(const struct cam *c, const u8 *p) {
 
 /* ---------------------------------------------------------------- blobs */
 static int find(int x) { while (lab[x] != x) { lab[x] = lab[lab[x]]; x = lab[x]; } return x; }
-static int blobs(int w, int h, int T, int mark, int nbl, u64 *sx, u64 *sy, u32 *np, int *pk, u32 *sat) {
+/* sx,sy: centroid sums (x10+5). np: pixels. pk: peak. sat: pixels at the top level.
+ * fl: sum of the pixels -- the FLUX, i.e. the one amplitude measure that does not peg at 255 the
+ * moment a dot saturates, which the peak does on every real dot. box: 4 ints per blob (min x, min
+ * y, max x, max y) so the PC can tell a round speck from a streak or a rectangle. */
+static int blobs(int w, int h, int T, int mark, int nbl, u64 *sx, u64 *sy, u32 *np, int *pk, u32 *sat, u32 *fl,
+                 int *box) {
   int cw = w>>4, ch = h>>4, nc = cw*ch;
   for (int q = 0; q < nc; q++) cells[q] = 0;
   const u64 add = 0x0101010101010101ull * (u64)(127 - (T-1 > 127 ? 127 : T-1));
@@ -320,15 +325,21 @@ static int blobs(int w, int h, int T, int mark, int nbl, u64 *sx, u64 *sy, u32 *
     if (!cells[q]) continue;
     int r = find(q), bi = -1;
     for (int e = b0; e < nbl; e++) if (roots[e] == r) { bi = e; break; }
-    if (bi < 0) { if (nbl == MAXB) continue; bi = nbl++; roots[bi] = r; sx[bi]=sy[bi]=0; np[bi]=0; pk[bi]=0; sat[bi]=0; }
+    if (bi < 0) { if (nbl == MAXB) continue; bi = nbl++; roots[bi] = r; sx[bi]=sy[bi]=0; np[bi]=0; pk[bi]=0; sat[bi]=0; fl[bi]=0;
+                  box[4*bi]=box[4*bi+1]=box[4*bi+2]=box[4*bi+3]=0; }
     int x0 = (q%cw)*16, y0 = (q/cw)*16;
     for (int y = y0; y < y0+16; y++) {
       const u8 *row = scratch + (size_t)y*w;
       for (int x = x0; x < x0+16; x++) {
         int v = row[x]; if (v > pk[bi]) pk[bi] = v;
         if (v < T) continue;
-        sx[bi] += (u64)(x*10+5); sy[bi] += (u64)(y*10+5); np[bi]++;
+        sx[bi] += (u64)(x*10+5); sy[bi] += (u64)(y*10+5);
+        fl[bi] += (u32)v;
         if (v >= 250) sat[bi]++;
+        if (!np[bi]) { box[4*bi] = box[4*bi+2] = x; box[4*bi+1] = box[4*bi+3] = y; }
+        else { if (x < box[4*bi]) box[4*bi] = x; else if (x > box[4*bi+2]) box[4*bi+2] = x;
+               if (y < box[4*bi+1]) box[4*bi+1] = y; else if (y > box[4*bi+3]) box[4*bi+3] = y; }
+        np[bi]++;
       }
     }
   }
@@ -672,17 +683,19 @@ static void frame(int k, int i, const struct v4l2_buffer *b) {
   cpu_access(c->fd[i], 1);
   if (torn(c, i, b)) return;
   dump_frame(k, scratch, c->w, c->h, cls, b->sequence, mean, c->rmax);   // LHSIGHT2_DUMP: the exact input
-  u64 sx[MAXB], sy[MAXB]; u32 np[MAXB]; int pk[MAXB]; u32 sat[MAXB];
+  u64 sx[MAXB], sy[MAXB]; u32 np[MAXB], fl[MAXB]; int pk[MAXB]; u32 sat[MAXB]; int box[MAXB*4];
   int T = mean*4/10; if (T < 64) T = 64;
   int nc = (c->w>>4)*(c->h>>4);
   memset(hot, 0, (size_t)nc);
-  int nbl = blobs(c->w, c->h, 250, 1, 0, sx, sy, np, pk, sat);
-  if (T < 250) nbl = blobs(c->w, c->h, T, 0, nbl, sx, sy, np, pk, sat);
+  int nbl = blobs(c->w, c->h, 250, 1, 0, sx, sy, np, pk, sat, fl, box);
+  if (T < 250) nbl = blobs(c->w, c->h, T, 0, nbl, sx, sy, np, pk, sat, fl, box);
   /* RAW: every blob the detector finds is sent, no filtering of any kind.
    * All gating lives PC-side. */
-  char bl[1800] = {0}; int L2 = 0, n = 0;
+  char bl[2400] = {0}; int L2 = 0, n = 0;
   for (int e = 0; e < nbl; e++) {
-    L2 += snprintf(bl+L2, sizeof bl-L2, " %lld %lld %u %d", (long long)sx[e]/np[e], (long long)sy[e]/np[e], np[e], pk[e]);
+    // x10 y10 npx peak sat flux w h : the last four are what the blob's SHAPE is made of
+    L2 += snprintf(bl+L2, sizeof bl-L2, " %lld %lld %u %d %u %u %d %d", (long long)sx[e]/np[e], (long long)sy[e]/np[e],
+                   np[e], pk[e], sat[e], fl[e], box[4*e+2]-box[4*e]+1, box[4*e+3]-box[4*e+1]+1);
     n++;
     if (L2 > (int)sizeof bl - 96) break;
   }
