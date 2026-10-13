@@ -3718,8 +3718,19 @@ void Sync::AcquireFromCandidates(double t) {
     why = Fmt("the best pair is %.1f cm off the baseline, past the %.0f cm a fit must hold to be installed",
               band * 100, kBaseAccept * 100);
   } else if (bi >= 0 && bsc >= 20) {
+    // A fit that needs the WITNESS is a close call by definition: the 2x rule could not separate it, so
+    // a motion reading decides -- and that reading has the same shape for a right fit and a wrong one.
+    // Measured: +0.84/-0.84 on a user-confirmed-correct lock (support 767) and +0.82/-0.82 on a wrong
+    // one four minutes later (support 80). What DID separate them is how much light agrees: correct
+    // locks scored 628 and 767 rays inside the gate, every wrong one 80-200. So the witness may only
+    // break a tie that is worth breaking, while a low-support fit may still lock when it is UNAMBIGUOUS
+    // on the 2x rule alone -- the evidence then decides, not the devices.
+    const int kStrongSupport = 300;
     if (ssc == 0 || ssc < 20 || bsc >= 2 * ssc) {
       accept = true; wi = pairs[bi].i; wj = pairs[bi].j; x = xb; wsc = bsc;
+    } else if (ri >= 0 && bsc < kStrongSupport) {
+      why = Fmt("too close to call (%d against %d) and only %d rays agree: not enough light to break the "
+                "tie with the worn or held devices (needs %d at this kind of margin)", bsc, ssc, bsc, kStrongSupport);
     } else if (ri >= 0) {
       // Two real solutions -- the mirror case. Two stations facing each other fit as well turned
       // 180 deg about their midpoint, and the ORIENTATIONS cannot break the tie (measured: the mirror
