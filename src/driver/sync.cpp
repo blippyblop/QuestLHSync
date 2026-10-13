@@ -3340,6 +3340,23 @@ static double PointResidual(const V3 *O, const V3 *D, int n, V3 *qout = nullptr)
   return std::sqrt(s / n);
 }
 
+// The three-state verdict on a candidate, from the evidence it already carries. Only POSITIVE
+// evidence rejects. See Sync::QKind for why a flat beat is not evidence and why the test is the
+// 0.3 ms exposure: a source that appears in the short frames nearly every time they look is
+// radiating continuously -- a lamp, a window, a glint -- because a beam sweeping past cannot.
+static int QKindOf(int ps, int psn) {
+  if (psn < Sync::kQKindN) return Sync::QK_UNKNOWN;      // too few short-frame looks to judge either way
+  if (ps <= 0) return Sync::QK_UNKNOWN;                  // absent from the short frames: ambiguous, not evidence
+  double r = (double)ps / psn;
+  if (r >= Sync::kQMains) return Sync::QK_REJECT;
+  if (r <= Sync::kQSpeck) return Sync::QK_SOURCE;
+  return Sync::QK_UNKNOWN;                               // in between: refuse to judge
+}
+static double QWeight(int kind) { return kind == Sync::QK_SOURCE ? 1.0 : Sync::kQUnknownW; }
+static const char *QName(int kind) {
+  return kind == Sync::QK_SOURCE ? "source-like" : kind == Sync::QK_REJECT ? "CONTINUOUS" : "unknown";
+}
+
 void Sync::CellsSweep(double t) {
   long lit = 0, watched = 0; double best_rate = 0; long best_seen = 0, best_vis = 0;
   cands_.clear();   // rebuilt every sweep: the layout matcher reads this snapshot
@@ -3570,9 +3587,9 @@ void Sync::CellsSweep(double t) {
         int l1 = 0;
         for (uint8_t e : cd.ring) l1 += e;
         log_(Fmt("candidate naming: q[%.1f %.1f %.1f] seen %ld: %s (%.3f, next %.3f) on %d frames, %d seen; L %d/%zu S %d/%d; "
-                 "proj L %d/%d S %d/%d; short footprint %.0f px on %d",
+                 "proj L %d/%d S %d/%d; short footprint %.0f px on %d; %s (%d/%d short)",
                  cd.q.x, cd.q.y, cd.q.z, cd.seen, clear ? cn[b].c_str() : "no channel", sc[b], other, (int)v.size(), seen,
-                 l1, cd.ring.size(), cd.sh, cd.sf, cd.pl, cd.pln, cd.ps, cd.psn, cd.snpx, cd.sn));
+                 l1, cd.ring.size(), cd.sh, cd.sf, cd.pl, cd.pln, cd.ps, cd.psn, cd.snpx, cd.sn, QName(cd.kind), cd.ps, cd.psn));
       }
     }
   }
@@ -3599,11 +3616,18 @@ void Sync::AcquireFromCandidates(double t) {
   if (S.size() != 2) return;
   int bi = -1, bj = -1, bsc = 0, ssc = 0;
   double bw = -1;
+  int rej_pairs = 0, scored = 0;
   for (int i = 0; i < (int)cands_.size(); i++) {
     for (int j = 0; j < (int)cands_.size(); j++) {
       if (i == j) continue;
       V3 vq = cands_[j].q - cands_[i].q, vs = S[1] - S[0];
       if (std::hypot(vq.x, vq.z) < 0.5 || std::hypot(vs.x, vs.z) < 0.5) continue;
+      // EVIDENCE GATE, deliberately soft. A pair with POSITIVE evidence of continuous emission on
+      // either side is not scored at all. Everything else is scored, and source-like candidates
+      // outrank unknown ones -- so a gate that is wrong degrades the ORDER of the pairs rather than
+      // making acquisition impossible, and an unknown candidate is never punished for silence.
+      if (cands_[i].kind == QK_REJECT || cands_[j].kind == QK_REJECT) { rej_pairs++; continue; }
+      scored++;
       // YawFit(A,B) returns the transform mapping A -> B. x maps the LIGHTHOUSE universe onto the
       // head/SLAM one (x(S) = Ry(yaw)*S + t, as Seed and Hypotheses build it), so the stations go
       // first and the candidates (SLAM-side 3D points) second. Reversed, x is the inverse map and
@@ -3616,7 +3640,7 @@ void Sync::AcquireFromCandidates(double t) {
       // the beat only BREAKS NEAR-TIES. As a multiplicative weight (sc * (1 + 0.25*beat)) it let a
       // high-beat pair win over one with more support, while the runner-up stayed raw -- so the
       // runner-up came out ABOVE the best (measured: 928 vs 1031) and nothing could ever accept.
-      double w = sc + 0.05 * std::min(cands_[i].beat, cands_[j].beat);
+      double w = QWeight(cands_[i].kind) * QWeight(cands_[j].kind) * sc + 0.05 * std::min(cands_[i].beat, cands_[j].beat);
       if (w > bw) { bw = w; bsc = sc; bi = i; bj = j; }
     }
   }
@@ -3635,6 +3659,7 @@ void Sync::AcquireFromCandidates(double t) {
         if (i == j) continue;
         V3 vq = cands_[j].q - cands_[i].q, vs = S[1] - S[0];
         if (std::hypot(vq.x, vq.z) < 0.5 || std::hypot(vs.x, vs.z) < 0.5) continue;
+        if (cands_[i].kind == QK_REJECT || cands_[j].kind == QK_REJECT) continue;  // gated, like the best
         X4 x = YawFit({S[0], S[1]}, {cands_[i].q, cands_[j].q});
         if (Apart(x, xb, S) <= kSameX) continue;
         int sc = solver_.ScoreX(x, 1.0);
@@ -3665,19 +3690,48 @@ void Sync::AcquireFromCandidates(double t) {
       else why = "two real solutions, no witness";
     }
   }
+  // the three-state verdict, once the merge has pooled every arm's short-frame evidence
+  int nsrc = 0, nrej = 0, nunk = 0;
+  for (Cand &c : cands_) {
+    c.kind = (uint8_t)QKindOf(c.ps, c.psn);
+    if (c.kind == QK_SOURCE) nsrc++;
+    else if (c.kind == QK_REJECT) nrej++;
+    else nunk++;
+  }
   if (t > cand_log_) {   // shares the 60 s evidence-watch throttle
     cand_log_ = t + 60;
     std::string s2 = ri >= 0 ? Fmt(" [rival %d at yaw %+.1f, apart %.1f m]", ssc, xr[0] * kDeg, Apart(xr, xb, S)) : std::string();
-    log_(Fmt("acquisition: %d candidate pairs scored, best support %d/%.1f deg%s%s", bi < 0 ? 0 : (int)cands_.size() * ((int)cands_.size() - 1),
+    log_(Fmt("acquisition: %d pairs scored (%d skipped: continuous evidence), best support %d/%.1f deg%s%s", scored, rej_pairs,
              bsc, xb[0] * kDeg, s2.c_str(),
              accept ? Fmt(" -- accepted%s", why.empty() ? "" : Fmt(" (%s)", why.c_str()).c_str()).c_str()
                     : " -- ambiguous or unsupported: holding"));
   }
   if (!accept) return;
+  {   // What would the enumeration have preferred WITHOUT the evidence gate? Removing clutter pairs
+      // also shrinks the runner-up, which flatters the 2x rule: the fit would then be installed on
+      // apparent confidence that the gate created. Computed only on the accept path, so the cost is
+      // paid once per lock rather than every sweep, and said out loud when the gate was decisive.
+      int ub = 0, ubi = -1, ubj = -1, usr = 0, usri = -1, usrj = -1;
+      for (int i = 0; i < (int)cands_.size(); i++)
+        for (int j = 0; j < (int)cands_.size(); j++) {
+          if (i == j) continue;
+          V3 vq = cands_[j].q - cands_[i].q, vs = S[1] - S[0];
+          if (std::hypot(vq.x, vq.z) < 0.5 || std::hypot(vs.x, vs.z) < 0.5) continue;
+          X4 xu = YawFit({S[0], S[1]}, {cands_[i].q, cands_[j].q});
+          int sc = solver_.ScoreX(xu, 1.0);
+          if (sc > ub) { ub = sc; ubi = i; ubj = j; }
+          if (Apart(xu, xb, S) > 1.0 && sc > usr) { usr = sc; usri = i; usrj = j; }  // 1.0 m == kSameX: a distinct solution
+        }
+      bool decisive = ub > wsc || usr > ssc;
+      log_(Fmt("the evidence gate: gated best %d, gated rival %d | UNGATED best %d%s, ungated rival %d%s%s",
+               wsc, ssc, ub, ubi >= 0 ? Fmt(" (candidates %d,%d %s/%s)", ubi, ubj, QName(cands_[ubi].kind), QName(cands_[ubj].kind)).c_str() : "",
+               usr, usri >= 0 ? Fmt(" (candidates %d,%d %s/%s)", usri, usrj, QName(cands_[usri].kind), QName(cands_[usrj].kind)).c_str() : "",
+               decisive ? " -- the gate was DECISIVE, so it carries the blame if this fit is wrong" : " -- the gate changed nothing here"));
+  }
   solver_.Reset(x);
   solver_.SetLockTime(t);
-  log_(Fmt("acquired by enumeration: candidates %d,%d support %d (rival %d, beats %.2f/%.2f) yaw %+.2f deg t [%.2f %.2f %.2f]%s",
-           wi, wj, wsc, ssc, cands_[wi].beat, cands_[wj].beat, x[0] * 180 / kPi, x[1], x[2], x[3],
+  log_(Fmt("acquired by enumeration: candidates %d,%d (%s/%s) support %d (rival %d, beats %.2f/%.2f) yaw %+.2f deg t [%.2f %.2f %.2f]%s",
+           wi, wj, QName(cands_[wi].kind), QName(cands_[wj].kind), wsc, ssc, cands_[wi].beat, cands_[wj].beat, x[0] * 180 / kPi, x[1], x[2], x[3],
            why.empty() ? "" : Fmt(" (%s)", why.c_str()).c_str()));
 }
 
@@ -3707,7 +3761,9 @@ void Sync::MatchSweep(double t) {
     for (size_t i = 0; i < cands_.size() && i < 6; i++)
       s += Fmt("  q[%.1f %.1f %.1f] beat %.2f seen %ld%s", cands_[i].q.x, cands_[i].q.y, cands_[i].q.z,
                cands_[i].beat, cands_[i].seen, cands_[i].keys.size() > 1 ? Fmt(" (%d arms)", (int)cands_[i].keys.size() - 1).c_str() : "");
-    log_(Fmt("candidates: %zu.%s", cands_.size(), s.c_str()));  }
+    int nsrc = 0, nunk = 0, nrej = 0;
+    for (const Cand &c : cands_) { if (c.kind == QK_SOURCE) nsrc++; else if (c.kind == QK_REJECT) nrej++; else nunk++; }
+    log_(Fmt("candidates: %zu (%d source-like, %d unknown, %d continuous/rejected).%s", cands_.size(), nsrc, nunk, nrej, s.c_str()));  }
 }
 
 void Sync::Use(const Shot &f) {
@@ -3992,6 +4048,10 @@ Sync::MatchReport Sync::MatchLayout(const V3 *P, int n) {
     for (int k = 0; k < n && ok; k++) {
       double e = norm(cands_[perm[k]].q - P[k]);
       if (e > kTol) { ok = false; break; }
+      // ... and it must not land on a candidate the short frames say radiates continuously: a
+      // predicted station on a lamp is not a correspondence, it is a coincidence. This is the guard
+      // that catches a wrong acquisition quickly, so it is the one place the reject state is hard.
+      if (cands_[perm[k]].kind == QK_REJECT) { ok = false; break; }
       s += e;
     }
     if (!ok) continue;

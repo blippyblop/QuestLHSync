@@ -554,7 +554,21 @@ class Sync {
   // layout matcher (shadow rollout): candidates from the 3D cell layer vs the predicted slam-space
   // station positions x^-1(S_k). Fixed tolerance floors only -- the forged +-1.4 cm covariance event
   // showed C cannot be trusted as a tolerance.
+  // What the evidence says a candidate is, in THREE states, never two. Positive evidence that a
+  // candidate is not a station is worth acting on; the absence of evidence is not. A flat rotor beat
+  // is NOT such evidence -- a station reads ~0 when its rotor frequency sits near a multiple of the
+  // frame rate, when the ring is short, or when the period was learned badly (the merge guard holds
+  // apart true cells reading 0.00 beside a beating neighbour), and a PWM-dimmed lamp beats as
+  // merrily as a station does. So the only reject test is CONTINUOUS emission in the 0.3 ms
+  // exposure, which a beam sweeping past cannot fake, and everything unjudgeable stays unknown.
+  enum QKind { QK_UNKNOWN = 0, QK_SOURCE = 1, QK_REJECT = 2 };
+  static constexpr float kQMains = 0.70f;     // S/L hit ratio at or above this: radiated continuously
+  static constexpr float kQSpeck = 0.50f;     // ... at or below this, with hits: a speck, laser-like
+  static constexpr int kQKindN = 12;          // fewer short-frame looks than this: no judgement at all
+  static constexpr double kQUnknownW = 0.95;  // ranking weight: a source-like pair outranks an unknown one
+
   struct Cand { V3 q; float res; long seen; uint64_t key; float beat = 0; bool beatm = false; std::vector<uint64_t> keys; int sh = 0, sf = 0;
+                uint8_t kind = QK_UNKNOWN;   // QKind: assessed by QKindOf once the merge has pooled the evidence
                 V3 dir, dir0; int cam = -1; bool trav = false; bool mains = false; std::vector<uint8_t> ring;
                 int pl = 0, pln = 0, ps = 0, psn = 0;
                 float snpx = 0; int sn = 0; };  // the SHORT frames' footprint here: a dot stays a dot in 0.3 ms, an extended source does not  // projection presence: long/short hits over the frames the place was in image  // angular merge: direction now/first, camera, head traveled, L presence ring; beatm = the beat score was measurable (a short ring scores 0, which is "unknown", not "flat")
