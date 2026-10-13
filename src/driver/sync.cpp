@@ -3614,114 +3614,123 @@ void Sync::AcquireFromCandidates(double t) {
   std::vector<V3> S, Z;
   solver_.Stations(keys, S, Z);
   if (S.size() != 2) return;
-  int bi = -1, bj = -1, bsc = 0, ssc = 0;
-  double bw = -1;
-  int rej_pairs = 0, scored = 0;
-  for (int i = 0; i < (int)cands_.size(); i++) {
-    for (int j = 0; j < (int)cands_.size(); j++) {
+  // THE BASELINE. The two stations sit a measured distance apart in the Lighthouse frame -- SteamVR's
+  // own numbers, 4.913 m in the room this was written for -- and x is RIGID (a yaw and a translation),
+  // so a valid pair of candidate places must be that same distance apart in SLAM space. Nothing here
+  // used to check it: the only geometric guard was "more than half a metre apart", which admits the
+  // whole room and is how clutter pairs kept winning the support contest.
+  //
+  // The camera-measured places are not good to the millimetre, so the tolerance RATCHETS instead of
+  // being one number: the tightest band that yields a fit worth accepting wins, and nothing beyond
+  // kBaseTolMax is ever considered at all -- a pair further off than that is both probably wrong and
+  // too inaccurate to be the answer we want. It is also much cheaper than what it replaces: the
+  // per-pair ScoreX over thousands of rays now only runs on the few pairs inside the current band.
+  const double kBaseTolMax = 0.05, kBaseTolStep = 0.01;
+  const double base_s = norm(S[1] - S[0]);
+  struct Pair { int i, j; double e; };   // e = how far this pair's separation is from the baseline
+  std::vector<Pair> pairs;
+  int rej_pairs = 0, far_pairs = 0;
+  const int n = (int)cands_.size();
+  for (int i = 0; i < n; i++) {
+    for (int j = 0; j < n; j++) {
       if (i == j) continue;
       V3 vq = cands_[j].q - cands_[i].q, vs = S[1] - S[0];
       if (std::hypot(vq.x, vq.z) < 0.5 || std::hypot(vs.x, vs.z) < 0.5) continue;
-      // EVIDENCE GATE, deliberately soft. A pair with POSITIVE evidence of continuous emission on
+      // EVIDENCE GATE, deliberately soft: a pair with POSITIVE evidence of continuous emission on
       // either side is not scored at all. Everything else is scored, and source-like candidates
-      // outrank unknown ones -- so a gate that is wrong degrades the ORDER of the pairs rather than
-      // making acquisition impossible, and an unknown candidate is never punished for silence.
+      // outrank unknown ones, so a wrong gate degrades the ORDER of the pairs rather than making
+      // acquisition impossible, and an unknown candidate is never punished for silence.
       if (cands_[i].kind == QK_REJECT || cands_[j].kind == QK_REJECT) { rej_pairs++; continue; }
-      scored++;
-      // YawFit(A,B) returns the transform mapping A -> B. x maps the LIGHTHOUSE universe onto the
-      // head/SLAM one (x(S) = Ry(yaw)*S + t, as Seed and Hypotheses build it), so the stations go
-      // first and the candidates (SLAM-side 3D points) second. Reversed, x is the inverse map and
-      // ScoreX measures nothing -- the support sits at chance (measured: 0-2 over ~16k rays).
-      // ScoreX's gate is in DEGREES (Nearest returns acos*dDeg); 1.0/kDeg made it 0.0175 deg, so
-      // support was "rays that fit to a hundredth of a degree" -- 0-2, indistinguishable from
-      // chance, and with the RANSAC acquirer retired nothing could ever lock. The gate is 1 deg.
-      X4 x = YawFit({S[0], S[1]}, {cands_[i].q, cands_[j].q});
-      int sc = solver_.ScoreX(x, 1.0);
-      // the beat only BREAKS NEAR-TIES. As a multiplicative weight (sc * (1 + 0.25*beat)) it let a
-      // high-beat pair win over one with more support, while the runner-up stayed raw -- so the
-      // runner-up came out ABOVE the best (measured: 928 vs 1031) and nothing could ever accept.
-      double w = QWeight(cands_[i].kind) * QWeight(cands_[j].kind) * sc + 0.05 * std::min(cands_[i].beat, cands_[j].beat);
-      if (w > bw) { bw = w; bsc = sc; bi = i; bj = j; }
+      double e = std::fabs(norm(vq) - base_s);
+      if (e > kBaseTolMax) { far_pairs++; continue; }
+      pairs.push_back({i, j, e});
     }
   }
-  // the runner-up is the best pair that fits a DIFFERENT alignment. When one source splits across
-  // several candidates (a starburst's arms, the same dot in two cameras), many pairs fit the SAME
-  // x; scored against the best they read as a nearly-equal second solution and the enumeration
-  // holds forever (measured: 455 vs 326, same two stations both ways). Ambiguity is about distinct
-  // x, not distinct pairs, so a pair within kSameX of the best is the same answer, not a rival.
-  X4 xb{}, xr{};
-  int ri = -1, rj = -1;
-  if (bi >= 0) {
-    xb = YawFit({S[0], S[1]}, {cands_[bi].q, cands_[bj].q});
-    const double kSameX = 1.0;   // m: two fits predicting the stations within this are one solution
-    for (int i = 0; i < (int)cands_.size(); i++) {
-      for (int j = 0; j < (int)cands_.size(); j++) {
-        if (i == j) continue;
-        V3 vq = cands_[j].q - cands_[i].q, vs = S[1] - S[0];
-        if (std::hypot(vq.x, vq.z) < 0.5 || std::hypot(vs.x, vs.z) < 0.5) continue;
-        if (cands_[i].kind == QK_REJECT || cands_[j].kind == QK_REJECT) continue;  // gated, like the best
-        X4 x = YawFit({S[0], S[1]}, {cands_[i].q, cands_[j].q});
-        if (Apart(x, xb, S) <= kSameX) continue;
-        int sc = solver_.ScoreX(x, 1.0);
-        if (sc > ssc) { ssc = sc; ri = i; rj = j; xr = x; }
-      }
-    }
-  }
-  // Two stations facing each other fit as well turned 180 deg about their midpoint (a mirror), and
-  // rays alone cannot tell them apart -- the mirror put every other lighthouse device across the
-  // room. The devices the user wears or holds stay near the head, so they decide: the same witness
-  // Solver::CheckMirror used, now inside the candidate pipeline. No witness -> hold, never guess.
+  // YawFit(A,B) returns the transform mapping A -> B. x maps the LIGHTHOUSE universe onto the
+  // head/SLAM one (x(S) = Ry(yaw)*S + t), so the stations go first and the candidates second.
+  // Reversed, x is the inverse map and ScoreX measures nothing (measured: 0-2 support over ~16k
+  // rays). ScoreX's gate is in DEGREES (Nearest returns acos*kDeg); 1.0/kDeg made it 0.0175 deg.
+  int wi = -1, wj = -1, wsc = 0, ssc = 0, ri = -1, rj = -1;
+  X4 x{}, xb{}, xr{};
+  double band = 0;
   bool accept = false;
-  int wi = -1, wj = -1, wsc = bsc;
-  X4 x{};
   std::string why;
-  if (bi >= 0 && bsc >= 20) {
-    if (ssc == 0 || ssc < 20 || bsc >= 2 * ssc) {
-      accept = true; wi = bi; wj = bj; x = xb; wsc = bsc;
-    } else if (ri >= 0) {
-      // Two real solutions -- the mirror case. The worn or held devices CAN CONFIRM the best, but a
-      // marginal reading must never INSTALL the runner-up: a +-0.2 motion reading once did, and the
-      // fit held one station and lost the other (then looped through re-earn). Confirm, never override.
+  int scored = 0, tried = 0, bsc_any = 0;
+  double band_any = 0;
+  const double kSameX = 1.0;   // m: two fits predicting the stations within this are ONE solution
+  // The ratchet: exact first, then one centimetre at a time. The runner-up is scored inside the same
+  // band, because ambiguity is about distinct solutions that are equally well supported AT THE SAME
+  // PRECISION -- comparing a tight fit against a loose one would be comparing two different questions.
+  for (double tol = kBaseTolStep; tol <= kBaseTolMax + 1e-9; tol += kBaseTolStep) {
+    std::vector<int> pi, pj, psc;
+    std::vector<X4> px;
+    for (const Pair &p : pairs) {
+      if (p.e > tol) continue;
+      X4 xa = YawFit({S[0], S[1]}, {cands_[p.i].q, cands_[p.j].q});
+      pi.push_back(p.i); pj.push_back(p.j); px.push_back(xa);
+      psc.push_back(solver_.ScoreX(xa, 1.0));
+      scored++;
+    }
+    tried++;
+    if (pi.empty()) continue;
+    int bi = -1, bsc = 0, lssc = 0, lri = -1, lrj = -1;
+    double bw = -1;
+    X4 lxb{}, lxr{};
+    for (size_t k = 0; k < pi.size(); k++) {
+      // the beat only BREAKS NEAR-TIES (as a multiplicative weight it once let a high-beat pair win
+      // over one with more support, and put the runner-up above the best)
+      double w = QWeight(cands_[pi[k]].kind) * QWeight(cands_[pj[k]].kind) * psc[k] +
+                 0.05 * std::min(cands_[pi[k]].beat, cands_[pj[k]].beat);
+      if (w > bw) { bw = w; bsc = psc[k]; bi = (int)k; lxb = px[k]; }
+    }
+    for (size_t k = 0; k < pi.size(); k++) {
+      if (Apart(px[k], lxb, S) <= kSameX) continue;   // the same answer, not a rival
+      if (psc[k] > lssc) { lssc = psc[k]; lri = pi[k]; lrj = pj[k]; lxr = px[k]; }
+    }
+    if (bsc > bsc_any) { bsc_any = bsc; band_any = tol; }
+    if (bsc < 20) continue;    // nothing here worth accepting: relax the precision and look again
+    bool ok = (lssc == 0 || lssc < 20 || bsc >= 2 * lssc);
+    std::string w2;
+    if (!ok && lri >= 0) {
+      // Two real solutions at this precision -- the mirror case. Two stations facing each other fit
+      // as well turned 180 deg about their midpoint, and the ORIENTATIONS cannot break the tie
+      // (measured: the mirror predicts axes 7.9 deg from the truth at both stations). The worn or
+      // held devices CAN CONFIRM the best; a marginal reading must never INSTALL the rival.
       double da, db;
       std::string how;
-      int fav = solver_.WitnessFavours(xb, xr, da, db, how);
-      if (fav == 1) { accept = true; wi = bi; wj = bj; x = xb; wsc = bsc; why = how; }
-      else if (fav == 2) why = Fmt("the worn or held devices favour the rival (%s) -- holding rather than install the runner-up", how.c_str());
-      else why = "two real solutions, no witness";
+      int fav = solver_.WitnessFavours(lxb, lxr, da, db, how);
+      if (fav == 1) { ok = true; w2 = how; }
+      else if (fav == 2) w2 = Fmt("the worn or held devices favour the rival (%s)", how.c_str());
+      else w2 = "two real solutions, no witness";
     }
-  }
-  // the three-state verdict, once the merge has pooled every arm's short-frame evidence
-  int nsrc = 0, nrej = 0, nunk = 0;
-  for (Cand &c : cands_) {
-    c.kind = (uint8_t)QKindOf(c.ps, c.psn);
-    if (c.kind == QK_SOURCE) nsrc++;
-    else if (c.kind == QK_REJECT) nrej++;
-    else nunk++;
+    if (!ok) continue;         // no match at this precision: tighten nothing, relax and retry
+    accept = true;
+    wi = pi[bi]; wj = pj[bi]; x = lxb; wsc = bsc; ssc = lssc; ri = lri; rj = lrj; xr = lxr;
+    band = tol; why = w2;
+    break;
   }
   if (t > cand_log_) {   // shares the 60 s evidence-watch throttle
     cand_log_ = t + 60;
     std::string s2 = ri >= 0 ? Fmt(" [rival %d at yaw %+.1f, apart %.1f m]", ssc, xr[0] * kDeg, Apart(xr, xb, S)) : std::string();
-    log_(Fmt("acquisition: %d pairs scored (%d skipped: continuous evidence), best support %d/%.1f deg%s%s", scored, rej_pairs,
-             bsc, xb[0] * kDeg, s2.c_str(),
-             accept ? Fmt(" -- accepted%s", why.empty() ? "" : Fmt(" (%s)", why.c_str()).c_str()).c_str()
-                    : " -- ambiguous or unsupported: holding"));
+    log_(Fmt("acquisition: %d pairs inside the baseline (%d skipped: continuous evidence, %d beyond %.0f cm), "
+             "%d scored over %d precision band(s); best support %d/%.1f deg%s%s", (int)pairs.size(), rej_pairs,
+             far_pairs, kBaseTolMax * 100, scored, tried, accept ? wsc : bsc_any, accept ? x[0] * kDeg : 0.0, s2.c_str(),
+             accept ? Fmt(" -- accepted at +/-%.0f cm%s", band * 100, why.empty() ? "" : Fmt(" (%s)", why.c_str()).c_str()).c_str()
+                    : Fmt(" -- ambiguous or unsupported: holding (best %d at +/-%.0f cm)", bsc_any, band_any * 100).c_str()));
   }
   if (!accept) return;
-  {   // What would the enumeration have preferred WITHOUT the evidence gate? Removing clutter pairs
-      // also shrinks the runner-up, which flatters the 2x rule: the fit would then be installed on
-      // apparent confidence that the gate created. Computed only on the accept path, so the cost is
-      // paid once per lock rather than every sweep, and said out loud when the gate was decisive.
+  {   // What would the enumeration have preferred WITHOUT the evidence gate, at the same precision?
+      // Removing clutter pairs also shrinks the runner-up, which flatters the 2x rule: the fit would
+      // then be installed on apparent confidence that the gate created. Computed only on the accept
+      // path, so the cost is paid once per lock, and said out loud when the gate was decisive.
       int ub = 0, ubi = -1, ubj = -1, usr = 0, usri = -1, usrj = -1;
-      for (int i = 0; i < (int)cands_.size(); i++)
-        for (int j = 0; j < (int)cands_.size(); j++) {
-          if (i == j) continue;
-          V3 vq = cands_[j].q - cands_[i].q, vs = S[1] - S[0];
-          if (std::hypot(vq.x, vq.z) < 0.5 || std::hypot(vs.x, vs.z) < 0.5) continue;
-          X4 xu = YawFit({S[0], S[1]}, {cands_[i].q, cands_[j].q});
-          int sc = solver_.ScoreX(xu, 1.0);
-          if (sc > ub) { ub = sc; ubi = i; ubj = j; }
-          if (Apart(xu, xb, S) > 1.0 && sc > usr) { usr = sc; usri = i; usrj = j; }  // 1.0 m == kSameX: a distinct solution
-        }
+      for (const Pair &p : pairs) {
+        if (p.e > band) continue;
+        X4 xu = YawFit({S[0], S[1]}, {cands_[p.i].q, cands_[p.j].q});
+        int sc = solver_.ScoreX(xu, 1.0);
+        if (sc > ub) { ub = sc; ubi = p.i; ubj = p.j; }
+        if (Apart(xu, xb, S) > kSameX && sc > usr) { usr = sc; usri = p.i; usrj = p.j; }
+      }
       bool decisive = ub > wsc || usr > ssc;
       log_(Fmt("the evidence gate: gated best %d, gated rival %d | UNGATED best %d%s, ungated rival %d%s%s",
                wsc, ssc, ub, ubi >= 0 ? Fmt(" (candidates %d,%d %s/%s)", ubi, ubj, QName(cands_[ubi].kind), QName(cands_[ubj].kind)).c_str() : "",
@@ -3730,9 +3739,10 @@ void Sync::AcquireFromCandidates(double t) {
   }
   solver_.Reset(x);
   solver_.SetLockTime(t);
-  log_(Fmt("acquired by enumeration: candidates %d,%d (%s/%s) support %d (rival %d, beats %.2f/%.2f) yaw %+.2f deg t [%.2f %.2f %.2f]%s",
-           wi, wj, QName(cands_[wi].kind), QName(cands_[wj].kind), wsc, ssc, cands_[wi].beat, cands_[wj].beat, x[0] * 180 / kPi, x[1], x[2], x[3],
-           why.empty() ? "" : Fmt(" (%s)", why.c_str()).c_str()));
+  log_(Fmt("acquired by enumeration: candidates %d,%d (%s/%s) support %d (rival %d, beats %.2f/%.2f) "
+           "yaw %+.2f deg t [%.2f %.2f %.2f], baseline +/-%.1f cm of %.3f m%s",
+           wi, wj, QName(cands_[wi].kind), QName(cands_[wj].kind), wsc, ssc, cands_[wi].beat, cands_[wj].beat,
+           x[0] * 180 / kPi, x[1], x[2], x[3], band * 100, base_s, why.empty() ? "" : Fmt(" (%s)", why.c_str()).c_str()));
 }
 
 void Sync::MatchSweep(double t) {
