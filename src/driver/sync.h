@@ -515,6 +515,10 @@ class Sync {
   // (rotation), the frame's turn on top of that now, and which reference frame (key). False when the cameras level it
   bool GravityFrame(M3 &C, M3 &turn, std::string &key);
   void SetGravity(bool on, const M3 &tilt) { frame_.SetGravity(on, tilt); }  // the driver's worker thread, as Tick
+  // Gravity is an INPUT the driver takes from SteamVR's hooks, not from the Frame, so it used to be
+  // the one input a recording did not carry: a replay then ran with the frame permanently unlevelled,
+  // which is invisible in a room that is already level and wrong by degrees in one that is not.
+  void RecGravity(double t, bool on, const M3 &tilt);
   void SetPaused(bool p) { paused_ = p; }
   // forgets everything learned about the alignment and starts over: the sightings, the fit, the saved alignment and
   // pose timing of this headset, and an automatic reference frame. Call from Tick's thread

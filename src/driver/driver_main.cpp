@@ -711,7 +711,10 @@ class Provider : public vr::IServerTrackedDeviceProvider {
         ref.ok = g_sync->GravityFrame(ref.C, ref.turn, ref.key);
         bool on;
         M3 tilt;
-        if (g_gravity->Step(ref, on, tilt)) g_sync->SetGravity(on, tilt);
+        if (g_gravity->Step(ref, on, tilt)) {
+          g_sync->SetGravity(on, tilt);
+          g_sync->RecGravity(now, on, tilt);   // an input, so the recording keeps it
+        }
       }
       if (!rel_done_ && now - started_ < 60) rel_done_ = g_rel->Hook();
       g_rel->Flush();

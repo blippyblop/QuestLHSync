@@ -100,6 +100,15 @@ int main(int argc, char **argv) {
           sync.SetChannels(chans);
         }
       }
+    } else if (kind == 'G') {  // gravity/tilt, straight from the driver's IMU hook
+      int on;
+      double m[9];
+      if (sscanf(rest, "%d %lf %lf %lf %lf %lf %lf %lf %lf %lf", &on, &m[0], &m[1], &m[2], &m[3], &m[4], &m[5], &m[6], &m[7], &m[8]) == 10) {
+        M3 g;
+        for (int r = 0; r < 3; r++)
+          for (int c = 0; c < 3; c++) g.m[r][c] = m[r * 3 + c];
+        sync.SetGravity(on != 0, g);
+      }
     } else if (kind == 'F') {
       sync.OnLine(pc, sp + 1);
     } else if (kind == 'B') {  // worn and held lighthouse devices (reference frame)

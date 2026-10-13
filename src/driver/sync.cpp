@@ -2727,6 +2727,12 @@ void Sync::SetStreamer(const std::string &system) {
 }
 
 // "Steam-Frame-1a2b3c4d": the model for the eye, a hash of the serial to tell two of a kind apart
+void Sync::RecGravity(double t, bool on, const M3 &tilt) {
+  if (!recording()) return;
+  Rec(t, "G %d %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f", on ? 1 : 0, tilt.m[0][0], tilt.m[0][1], tilt.m[0][2],
+      tilt.m[1][0], tilt.m[1][1], tilt.m[1][2], tilt.m[2][0], tilt.m[2][1], tilt.m[2][2]);
+}
+
 void Sync::SetHeadset(const std::string &serial, const std::string &model) {
   std::string name;
   for (char c : model.substr(0, 32)) {
@@ -3178,7 +3184,15 @@ void Sync::LogStages(double now) {
     }
     camsp_last_[k] = camsp_[k];
   }
-  if (!c.empty()) log_("collect (frames/dots/blobs since last, peak): " + c);
+  if (!c.empty()) {
+    log_("collect (frames/dots/blobs since last, peak): " + c);
+    // RECORDED, so a replay's own numbers can be diffed against the driver's. The recording carries
+    // every input, but a replay runs it on a different schedule -- the driver's periodic work fires on
+    // a wall clock interleaved with arriving data -- and until both sides' accounts of the SAME
+    // interval can be put side by side, that difference cannot be attributed. One line per ten seconds
+    // against ~240 frame lines a second: nothing.
+    Rec(now, "X collect %s", c.c_str());
+  }
   Spots sp = spots();
   long seen = sp.seen - stages_sp_.seen, used = sp.used - stages_sp_.used;
   long cells = 0, tri = 0, fuzz = 0, cand = 0;
@@ -3193,12 +3207,17 @@ void Sync::LogStages(double now) {
     // "dots" is the LONG frames' blobs -- the only ones that can be a ray. The short frames' dots are
     // counted separately (sp.sframe): they are evidence for the gate, never rays, so they must not sit
     // in the denominator as if they had been dropped.
-    log_(Fmt("stages: %ld long frames -> %ld dots -> %ld rays (%.0f%%) | dropped: still %ld, fast %ld, big %ld (kept big %ld), "
+    std::string sl = Fmt("stages: %ld long frames -> %ld dots -> %ld rays (%.0f%%) | dropped: still %ld, fast %ld, big %ld (kept big %ld), "
              "nopose %ld, dim %ld, S-gated %ld, fuzzy %ld, unmatched %ld | +%ld short-frame evidence dots | cells %ld (3D %ld, fuzzy %ld) -> candidates %ld",
              sp.frames - stages_sp_.frames, seen, used, seen ? 100.0 * used / seen : 0.0, sp.still - stages_sp_.still,
              sp.fast - stages_sp_.fast, sp.big - stages_sp_.big, sp.bigkeep - stages_sp_.bigkeep, sp.other - stages_sp_.other, sp.dim - stages_sp_.dim,
              sp.cellskip - stages_sp_.cellskip, sp.fuzz - stages_sp_.fuzz, sp.matchskip - stages_sp_.matchskip,
-             sp.sframe - stages_sp_.sframe, cells, tri, fuzz, cand));
+             sp.sframe - stages_sp_.sframe, cells, tri, fuzz, cand);
+    log_(sl);
+    // ... and RECORDED, so a replay's own account of the same interval can be put beside the driver's.
+    // The recording carries every input; what it could not carry is the driver's schedule, and until
+    // both sides account for the same ten seconds line by line that difference cannot be attributed.
+    Rec(now, "X %s", sl.c_str());
   }
   stages_sp_ = sp;
 }
