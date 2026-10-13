@@ -3630,7 +3630,11 @@ void Sync::AcquireFromCandidates(double t) {
   // downstream (the baseline check, the worn/held devices, the runner-up rule), and this way they get
   // something to decide on minutes sooner. A fit that only exists outside kBaseAccept is logged and
   // refused, not installed.
-  const double kBaseGenTol = 0.15, kBaseAccept = 0.05;
+  // 5 cm, not 15: a 15 cm window let the highest-SUPPORT pair be one whose separation was 14 cm off
+  // the baseline -- geometrically implausible on its face -- and made the ranking argue about pairs
+  // that could never be installed anyway. 5 cm is the window that is physically meaningful here, so
+  // the ranking only ever sees pairs that could actually win.
+  const double kBaseGenTol = 0.05, kBaseAccept = 0.05;
   const size_t kBaseGenMaxPairs = 400;
   const double base_s = norm(S[1] - S[0]);
   struct Pair { int i, j; double e; };   // e = how far this pair's separation is from the baseline
