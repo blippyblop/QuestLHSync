@@ -3561,6 +3561,26 @@ void Sync::CellsSweep(double t) {
     }
     if (!merged) cands_.push_back(c);
   }
+  // THE THREE-STATE VERDICT, WIRED. Assess every candidate once the merge has pooled its arms'
+  // short-frame evidence (ps/psn, filled by PresenceAt above). This is the only place in the whole
+  // pipeline that tells a base station from any other light source, and it had been DEAD: the
+  // assignment was dropped when AcquireFromCandidates was restructured into the ratchet (9b8fe2b),
+  // which left kind permanently QK_UNKNOWN. Three things silently stopped doing anything --
+  //   * the pair gate never dropped a pair ("0 skipped: continuous evidence" in every single run),
+  //   * QWeight was a constant (0.95 x 0.95), so it could not reorder pairs at all,
+  //   * the census counted a field nobody wrote, so its "0 source-like, N unknown" read as a
+  //     finding when it was a tautology.
+  // Restored here rather than at the tail of AcquireFromCandidates (where 9551624 first called it)
+  // so the pair loop reads THIS sweep's verdict rather than the previous sweep's.
+  //
+  // Positive evidence only, as designed: REJECT needs enough short-frame looks to judge
+  // (psn >= kQKindN) AND continuous hits (ps/psn >= kQMains). Silence is never evidence -- ps <= 0
+  // stays UNKNOWN -- so a station the short frames happen not to catch is never punished for it.
+  // NOTE the mismatch left standing: the comment above PresenceAt says the verdict must be the
+  // CONTRAST of the two classes, while QKindOf judges the absolute short rate. Stations measure
+  // 12-17% short and lamps near 100%, so a 0.70 absolute threshold does separate them; which of the
+  // two the rule should be is a measurement to settle on real recordings, not a guess to make here.
+  for (Cand &c : cands_) c.kind = (uint8_t)QKindOf(c.ps, c.psn);
   // diagnostic (LHS_CANDDUMP): the final candidate list against the predicted stations. Answers the
   // question the replay raises -- whether BOTH true stations survive as candidates, or one is lost.
   if (getenv("LHS_CANDDUMP")) {
@@ -3574,8 +3594,8 @@ void Sync::CellsSweep(double t) {
       double dmin = 1e9;
       int bk = -1;
       for (size_t k = 0; k < dP.size(); k++) { double d = norm(cd.q - dP[k]); if (d < dmin) { dmin = d; bk = (int)k; } }
-      s += Fmt("  [%zu] q[%.3f %.3f %.3f] res %.3f seen %ld arms %zu beat %.2f snpx %.0f sn %d", i, cd.q.x, cd.q.y,
-               cd.q.z, cd.res, cd.seen, cd.keys.size(), cd.beat, cd.snpx, cd.sn);
+      s += Fmt("  [%zu] q[%.3f %.3f %.3f] res %.3f seen %ld arms %zu beat %.2f snpx %.0f sn %d %s ps %d/%d", i, cd.q.x, cd.q.y,
+               cd.q.z, cd.res, cd.seen, cd.keys.size(), cd.beat, cd.snpx, cd.sn, QName(cd.kind), cd.ps, cd.psn);
       if (bk >= 0) s += Fmt(" dmin %.3f(st%d)", dmin, bk);
     }
     log_(Fmt("cand dump: %zu candidates (x %s)", cands_.size(), hx ? "known" : "unknown"));
