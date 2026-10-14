@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -3101,9 +3102,11 @@ void Sync::CellSeen(int cam, const V3 &w, float peak, double t) {
   uint64_t k = CellKey(cam, w);
   SpotCell &cl = cells_[k];
   if (!cl.inact) { cl.inact = true; actk_[cam].push_back(k); }
-  if (cl.seen == 0) { cl.cam = cam; cl.w = w; cl.w0 = w; }
+  if (cl.nblob == 0) { cl.cam = cam; cl.w = w; cl.w0 = w; }
   else cl.w = cl.w + (w - cl.w) * 0.1;
-  cl.seen++; cl.last = t;
+  // seen is NOT advanced here: it is a per-FRAME count and belongs with vis in MarkPresence. This is
+  // the count of blobs, kept only so the blobs-per-frame-per-cell figure stays measurable.
+  cl.nblob++; cl.last = t;
   // ampL is NOT pushed here: it is advanced by MarkPresence, one sample per long frame, 0 when the
   // dot is absent. A run of only the hits is not a time series and has no rotor beat in it.
   cl.amax = std::max(cl.amax, peak);
@@ -3160,6 +3163,7 @@ void Sync::MarkPresence(int cam, const M3 &R, double t, char cls, const std::vec
     if (ring.size() > 64) ring.erase(ring.begin());
     if (cls == 'L') {
       cl.vis++;   // the never-blinks rate's denominator: long frames with the direction on the image
+      if (on) cl.seen++;   // ... and its numerator: FRAMES a blob landed here (not blobs: see sync.h)
       cl.ampL.push_back(on ? (uint8_t)std::min(255, pk) : 0);   // zero-filled by frame: a hit-run is not a beat
       if (cl.ampL.size() > 64) cl.ampL.erase(cl.ampL.begin());
     }
@@ -3208,7 +3212,7 @@ void Sync::LogStages(double now) {
     // counted separately (sp.sframe): they are evidence for the gate, never rays, so they must not sit
     // in the denominator as if they had been dropped.
     std::string sl = Fmt("stages: %ld long frames -> %ld dots -> %ld rays (%.0f%%) | dropped: still %ld, fast %ld, big %ld (kept big %ld), "
-             "nopose %ld, dim %ld, S-gated %ld, fuzzy %ld, unmatched %ld | +%ld short-frame evidence dots | cells %ld (3D %ld, fuzzy %ld) -> candidates %ld",
+             "nopose %ld, dim-kept %ld (a low-peak dot that still reaches the solver, just not as a bright ray), S-gated %ld, fuzzy %ld, unmatched %ld | +%ld short-frame evidence dots | cells %ld (3D %ld, fuzzy %ld) -> candidates %ld",
              sp.frames - stages_sp_.frames, seen, used, seen ? 100.0 * used / seen : 0.0, sp.still - stages_sp_.still,
              sp.fast - stages_sp_.fast, sp.big - stages_sp_.big, sp.bigkeep - stages_sp_.bigkeep, sp.other - stages_sp_.other, sp.dim - stages_sp_.dim,
              sp.cellskip - stages_sp_.cellskip, sp.fuzz - stages_sp_.fuzz, sp.matchskip - stages_sp_.matchskip,
@@ -3409,6 +3413,7 @@ void Sync::CellsSweep(double t) {
       c = c * (1.0f / cl.nO);
       double spread = 0;
       for (int i = 0; i < cl.nO; i++) spread = std::max(spread, norm(cl.sO[i] - c));
+      cl.spread = (float)spread;
       cl.trav = spread >= kParallaxTravel;   // the head moved enough for the angular-offset (parallax) test to mean something
       if (spread >= 0.25) {   // enough head travel to triangulate at all
         cl.res3d = (float)PointResidual(cl.sO, cl.sD, cl.nO, &cl.q3);
@@ -3445,6 +3450,58 @@ void Sync::CellsSweep(double t) {
       if (cl.lit) lit++;
     }
     ++it;
+  }
+  // ---- STAGE-3 DIAGNOSTIC: the cell funnel, keyed on the true stations ----
+  // The candidate list is built from DIRECTION CELLS, and the question is whether the 3D-fit gates
+  // (in order: nO>=6 samples, spread>=0.25 m of head travel, res3d<=0.08 m) throw away the stations or
+  // only clutter. Three marginals cannot tell those apart, so the funnel is reported IN ORDER with the
+  // survivors at each step, and separately for the cells that look at a PREDICTED station (x must be
+  // known). Clutter cells SHOULD fail; only station cells failing is a defect. Failures are keyed by
+  // range because a source at r sweeps ~r/0.25 rad across the 2.4 deg cells per 0.25 m of travel, so a
+  // far station can leave its cell before the cell has the spread the fit demands (granularity/travel).
+  if (solver_.has_x()) {
+    std::vector<std::string> dk;
+    std::vector<V3> dS, dZ, dP, dZq;
+    solver_.Stations(dk, dS, dZ);
+    Solver::Predict(solver_.x(), dS, dZ, dP, dZq);
+    long A = 0, B = 0, C = 0, D = 0, sa = 0, sb = 0, sc = 0, sd = 0, sfuzz = 0;
+    long rng[4] = {}, rfail[4] = {};   // cells, and of those the ones without a 3D point, by range bucket
+    double bpf_sum = 0, bpf_max = 0; long bpf_n = 0, bpf_multi = 0;
+    for (auto &kv : cells_) {
+      SpotCell &cl = kv.second;
+      if (cl.seen < 16) continue;   // per-FRAME count now: the honest "well-seen" population
+      A++;
+      double bpf = cl.seen ? (double)cl.nblob / cl.seen : 0;
+      bpf_sum += bpf; bpf_n++; if (bpf > bpf_max) bpf_max = bpf; if (bpf > 1.5) bpf_multi++;
+      int st = 0; double rr = 0;
+      if (!dP.empty() && cl.nO > 0) {   // does this cell look at a predicted station?
+        int bk = -1; long bh = 0;
+        for (size_t k = 0; k < dP.size(); k++) {
+          long hit = 0;
+          for (int i = 0; i < cl.nO; i++) {
+            V3 wv = dP[k] - cl.sO[i];
+            double d = norm(wv), along = dot(wv, cl.sD[i]);
+            double perp = std::sqrt(std::max(0.0, d * d - along * along));
+            if (along > 0.3 && perp < 0.3) hit++;
+          }
+          if (hit > bh) { bh = hit; bk = (int)k; }
+        }
+        if (bk >= 0 && bh * 5 >= (long)cl.nO * 3) { st = bk + 1; rr = norm(cl.sO[0] - dP[bk]); }
+      }
+      if (rr <= 0 && cl.nO >= 4) { V3 qp; if (PointResidual(cl.sO, cl.sD, cl.nO, &qp) < 1e8) rr = norm(cl.sO[0] - qp); }
+      int rb = rr < 2 ? 0 : rr < 4 ? 1 : rr < 6 ? 2 : 3;
+      bool b1 = cl.nO >= 6, b2 = b1 && cl.spread >= 0.25f, b3 = b2 && cl.tri && cl.res3d <= 0.08f;
+      rng[rb]++;
+      if (b1) B++;
+      if (b2) C++;
+      if (b3) D++; else rfail[rb]++;
+      if (st) { sa++; if (b1) sb++; if (b2) sc++; if (b3) sd++; if (cl.tri && cl.fuzzy) sfuzz++; }
+    }
+    log_(Fmt("cell funnel (x known): seen>=16 %ld (station %ld) -> nO>=6 %ld (station %ld) -> spread>=0.25m %ld (station %ld) -> res3d<=0.08m %ld (station %ld); station cells fuzzy %ld",
+             A, sa, B, sb, C, sc, D, sd, sfuzz));
+    log_(Fmt("cell funnel by range (cells / of those 3D-failed): <2m %ld/%ld, 2-4m %ld/%ld, 4-6m %ld/%ld, >=6m %ld/%ld | blobs per frame per cell: mean %.2f max %.2f, %ld cells over 1.5",
+             rng[0], rfail[0], rng[1], rfail[1], rng[2], rfail[2], rng[3], rfail[3],
+             bpf_n ? bpf_sum / bpf_n : 0.0, bpf_max, bpf_multi));
   }
   PresenceAt(raw, t);   // the projection test, before the merge: the arms of one place pool their evidence
   // merge starburst fragments IN ANGLE: a starburst is an optical effect, so its arms sit at a
@@ -3503,6 +3560,26 @@ void Sync::CellsSweep(double t) {
       break;
     }
     if (!merged) cands_.push_back(c);
+  }
+  // diagnostic (LHS_CANDDUMP): the final candidate list against the predicted stations. Answers the
+  // question the replay raises -- whether BOTH true stations survive as candidates, or one is lost.
+  if (getenv("LHS_CANDDUMP")) {
+    std::vector<std::string> dk;
+    std::vector<V3> dS, dZ, dP, dZq;
+    bool hx = solver_.has_x();
+    if (hx) { solver_.Stations(dk, dS, dZ); Solver::Predict(solver_.x(), dS, dZ, dP, dZq); }
+    std::string s;
+    for (size_t i = 0; i < cands_.size(); i++) {
+      const Cand &cd = cands_[i];
+      double dmin = 1e9;
+      int bk = -1;
+      for (size_t k = 0; k < dP.size(); k++) { double d = norm(cd.q - dP[k]); if (d < dmin) { dmin = d; bk = (int)k; } }
+      s += Fmt("  [%zu] q[%.3f %.3f %.3f] res %.3f seen %ld arms %zu beat %.2f snpx %.0f sn %d", i, cd.q.x, cd.q.y,
+               cd.q.z, cd.res, cd.seen, cd.keys.size(), cd.beat, cd.snpx, cd.sn);
+      if (bk >= 0) s += Fmt(" dmin %.3f(st%d)", dmin, bk);
+    }
+    log_(Fmt("cand dump: %zu candidates (x %s)", cands_.size(), hx ? "known" : "unknown"));
+    log_(s);
   }
   // the S-frame verdict, at CANDIDATE level: a source's S-evidence pools across its merged
   // starburst members, so a lamp dies WHOLE -- before, arms with thin rings could keep a gated
@@ -3633,28 +3710,28 @@ void Sync::AcquireFromCandidates(double t) {
   std::vector<V3> S, Z;
   solver_.Stations(keys, S, Z);
   if (S.size() != 2) return;
-  // LOOSE FRONT, STRICT BACK.
+  // THE BASELINE BAND IS A COARSE PREFILTER, NOT THE DECISION.
   //
   // The baseline is a hard fact: the two stations sit a measured distance apart in the Lighthouse
-  // frame (SteamVR's own S lines) and x is rigid, so a valid pair of candidate places must be that
-  // same distance apart in SLAM space. But holding the RATCHET at both ends -- only considering pairs
-  // within 1 cm, then 2, ... -- meant the enumeration sat out the start of every session waiting for
-  // the camera-measured places to become accurate enough to enter the band at all: it took three
-  // minutes to lock on the 2026-10-13 walk, and that is the cost being paid here.
+  // frame (SteamVR's own S lines) and x is rigid, so a valid pair of candidate places must be about
+  // that distance apart in SLAM space. But the candidate PLACES are not that accurate, and the fit's
+  // own quality number cannot see it: res3d measures whether the rays AGREE with each other, not
+  // whether the point they agree on is in the right place. A small common rotation or timing bias
+  // lets every ray converge tightly (res3d well inside 8 cm) while the point shifts. MEASURED on the
+  // replay of the confirmed-good session (2026-10-13, sess1048): the true pair's separation came out
+  // 5.09 m against a 4.900 m baseline -- 19 cm off -- with one station's candidate 2.7 cm from the
+  // prediction and the other's 21.5 cm, both moving sweep to sweep. A 5 cm band therefore REJECTS the
+  // true pair before support ever gets to look at it, which is exactly why that replay never acquired.
   //
-  // So generation is generous and verification is not. Any pair within kBaseGenTol is a candidate for
-  // SCORING (the nearest-baseline kBaseGenMaxPairs of them, to bound the cost of ScoreX over
-  // thousands of rays), and the winner is then VERIFIED against kBaseAccept before anything is
-  // installed. Being generous here buys time, not confidence: every discriminator that decides is
-  // downstream (the baseline check, the worn/held devices, the runner-up rule), and this way they get
-  // something to decide on minutes sooner. A fit that only exists outside kBaseAccept is logged and
-  // refused, not installed.
-  // 5 cm, not 15: a 15 cm window let the highest-SUPPORT pair be one whose separation was 14 cm off
-  // the baseline -- geometrically implausible on its face -- and made the ranking argue about pairs
-  // that could never be installed anyway. 5 cm is the window that is physically meaningful here, so
-  // the ranking only ever sees pairs that could actually win.
-  const double kBaseGenTol = 0.05, kBaseAccept = 0.05;
-  const size_t kBaseGenMaxPairs = 400;
+  // So the band is widened to kBaseGenTol as a COARSE prefilter -- it only removes pairs that cannot
+  // be the two stations at any plausible accuracy -- and the DECISION is the ray support under the
+  // fitted x, which is clean evidence: hundreds of bright rays either agree with both station
+  // directions or they do not. Widening the front does not invite decoys because the runner-up rule
+  // still stands (a clear winner over the best different answer, still at kSameX), the strong-support
+  // floor still stands, and the worn/held devices still break only ties worth breaking. kBaseAccept
+  // is kept separate so verification can be tightened again without touching generation.
+  const double kBaseGenTol = 0.30, kBaseAccept = 0.30;
+  const size_t kBaseGenMaxPairs = 2000;
   const double base_s = norm(S[1] - S[0]);
   struct Pair { int i, j; double e; };   // e = how far this pair's separation is from the baseline
   std::vector<Pair> pairs;
@@ -3735,16 +3812,24 @@ void Sync::AcquireFromCandidates(double t) {
       // Two real solutions -- the mirror case. Two stations facing each other fit as well turned
       // 180 deg about their midpoint, and the ORIENTATIONS cannot break the tie (measured: the mirror
       // predicts axes 7.9 deg from the truth at both stations). The devices the user wears or holds
-      // stay near the head, so they decide. A marginal reading must never INSTALL the runner-up.
+      // stay near the head, so they DECIDE -- in EITHER direction (README: "when two base stations
+      // could be either way round, the devices you wear or hold decide"). Holding when they favour the
+      // rival was the bug that kept the confirmed-good session from ever locking: the replay found the
+      // true pair (support 380) with a rival at the true yaw (+41.0, support 363), the witness ruled
+      // for the rival, and the code refused to install it -- so the correct answer was found and
+      // thrown away every sweep. Installs the winner either way; the margin between the two is not
+      // what decides (that is the 2x rule's job, and it already failed to separate them).
       double da, db;
       std::string how;
       int fav = solver_.WitnessFavours(xb, xr, da, db, how);
       if (fav == 1) { accept = true; wi = pairs[bi].i; wj = pairs[bi].j; x = xb; wsc = bsc; why = how; }
-      else if (fav == 2) why = Fmt("the worn or held devices favour the rival (%s)", how.c_str());
-      else why = "two real solutions, no witness";
+      else if (fav == 2) {
+        accept = true; wi = pairs[ri].i; wj = pairs[ri].j; x = xr; wsc = ssc; band = pairs[ri].e;
+        why = Fmt("the worn or held devices prefer the rival, so IT is installed (%s)", how.c_str());
+      } else why = "two real solutions, no witness";
     }
   }
-  if (t > cand_log_) {   // shares the 60 s evidence-watch throttle
+  if (getenv("LHS_CANDLOG") || t > cand_log_) {   // shares the 60 s evidence-watch throttle (LHS_CANDLOG: every sweep)
     cand_log_ = t + 60;
     std::string s2 = ri >= 0 ? Fmt(" [rival %d at yaw %+.1f, apart %.1f m]", ssc, xr[0] * kDeg, Apart(xr, xb, S)) : std::string();
     log_(Fmt("acquisition: %d pairs generated within %.0f cm of the baseline (%.0f-%.1f cm of separation error, "
@@ -3943,7 +4028,7 @@ std::string Sync::Describe(const Spots &a, const Spots &b) {
   part(b.big - a.big, "lamps or windows (extended on the short frames too)");
   part(b.bigkeep - a.bigkeep, "kept though big: compact on the short frames, so a source");
   part(b.other - a.other, "without a headset pose");
-  part(b.dim - a.dim, "dim, kept for a room too light for the dots to saturate");
+  part(b.dim - a.dim, "dim (peak under kBright: still handed to the solver, only not counted as a bright ray)");
   part(b.cellskip - a.cellskip, "directions also lit on short frames (lamps, steady IR)");
   part(b.fuzz - a.fuzz, "directions that fail the 3D point test (glow, edges)");
   part(b.matchskip - a.matchskip, "directions the layout matcher did not accept");  part(b.sframe - a.sframe, "short-frame evidence dots");

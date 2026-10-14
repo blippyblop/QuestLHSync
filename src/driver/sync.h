@@ -510,6 +510,9 @@ class Sync {
   Transform Tick(double now);
   bool WillStep(double now) const { return now - last_step_ >= 1.0; }
   void ForceExpo(double e) { expo_ = e; }
+  // tools only: pin x to a known-good lock (yaw rad, tx, ty, tz) before replaying, so the Stage-3 cell
+  // diagnostic can key the cells on the TRUE stations instead of waiting for the replay to re-acquire
+  void ForceAlignment(const X4 &x) { solver_.Reset(x); solver_.SetLockTime(0); }
   // commands
   // a reference frame to level by gravity (gravity.h): SteamVR's frame -> the reference frame before gravity's tilt
   // (rotation), the frame's turn on top of that now, and which reference frame (key). False when the cameras level it
@@ -542,8 +545,15 @@ class Sync {
   // present in ~0.7-0.8 of the frames its direction was in view (the rotor
   // sweeps miss the exposure window at the beat period); a lamp or window is
   // ~1.0 and always saturated. Measured first, gated conservatively.
+  // seen and vis are the presence rate's two halves and MUST share a denominator: seen counts FRAMES
+  // in which a blob of this frame landed in the cell, vis counts FRAMES the direction was on the image.
+  // seen used to be counted per BLOB (CellSeen, once per blob): with two or three blobs landing in one
+  // cell in one frame, seen outran vis and the "presence rate" read 158%, 251% -- not a rate at all.
+  // nblob keeps the blobs, so how many blobs one frame puts in one cell stays visible (evidence for the
+  // cell-granularity question: a direction holding several blobs in one frame is a source fragmenting).
   struct SpotCell { int cam = 0; V3 w; V3 w0;  // w0 = the first direction seen (the parallax tie-break's "then")
-                   long seen = 0, vis = 0; float amax = 0, amin = 1e9f; double last = 0; bool lit = false; bool inact = false;
+                   long seen = 0, vis = 0, nblob = 0; float amax = 0, amin = 1e9f; double last = 0; bool lit = false; bool inact = false;
+                   float spread = 0;   // m: max sample distance from their centroid (the 3D fit's travel test)
                    std::vector<uint8_t> seqL; std::vector<uint8_t> seqS;  // per-class presence rings: 1 = dot this frame, 0 = in view, none
                    std::vector<uint8_t> ampL;  // peak ring on long frames: the rotor beat lives in AMPLITUDE (presence pegs)
                    V3 sO[12]; V3 sD[12]; V3 lastO; short nO = 0, slot_ = 0;  // ray samples spread across head travel (3D point test)
@@ -593,6 +603,10 @@ class Sync {
   static std::string Describe(const Spots &from, const Spots &to);
   void StationsForDump(std::vector<std::string> &keys, std::vector<V3> &S) const {  // tools
     std::vector<V3> Z;
+    solver_.Stations(keys, S, Z);
+  }
+  // ... with each station's facing axis too (the ray-support test is directional: see Solver::Nearest)
+  void StationsForDumpZ(std::vector<std::string> &keys, std::vector<V3> &S, std::vector<V3> &Z) const {
     solver_.Stations(keys, S, Z);
   }
   // recording: every input as log records (qlhs_replay reads them)

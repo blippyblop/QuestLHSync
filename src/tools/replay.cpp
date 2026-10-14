@@ -18,7 +18,7 @@
 #include "../driver/sync.h"
 
 int main(int argc, char **argv) {
-  std::string log, calib, dir, outp, xfp;
+  std::string log, calib, dir, outp, xfp, xs;
   bool learn = false, learn_grid = false, pings = false;
   double expo = -1;
   std::map<std::string, int> chans;
@@ -34,6 +34,7 @@ int main(int argc, char **argv) {
     else if (a == "--xf" && i + 1 < argc) xfp = argv[++i];
     else if (a == "--rays" && i + 1 < argc) g_ray_dump = fopen(argv[++i], "w");  // every sighting + the stations
     else if (a == "--expo" && i + 1 < argc) expo = atof(argv[++i]);
+    else if (a == "--x" && i + 1 < argc) xs = argv[++i];  // "yaw_deg tx ty tz": a known-good lock to key the cell diagnostic on
     else if (a == "--learn") learn = true;
     else if (a == "--learn-grid") learn_grid = true;
     else if (a == "--pings") pings = true;
@@ -56,6 +57,11 @@ int main(int argc, char **argv) {
   sync.SetChannels(chans);
   std::string err;
   if (!sync.SetCalibration(ss.str(), &err)) { fprintf(stderr, "calibration: %s\n", err.c_str()); return 1; }
+  if (!xs.empty()) {
+    double y = 0, t1 = 0, t2 = 0, t3 = 0;
+    if (sscanf(xs.c_str(), "%lf %lf %lf %lf", &y, &t1, &t2, &t3) == 4)
+      { sync.ForceAlignment(X4{y / kDeg, t1, t2, t3}); fprintf(stderr, "x pinned: yaw %+.2f deg t [%.2f %.2f %.2f]\n", y, t1, t2, t3); }
+  }
   FILE *out = outp.empty() ? nullptr : fopen(outp.c_str(), "w");
   FILE *xf = xfp.empty() ? nullptr : fopen(xfp.c_str(), "w");
   long ticks = 0;
@@ -153,9 +159,10 @@ int main(int argc, char **argv) {
   if (xf) fclose(xf);
   if (g_ray_dump) {
     std::vector<std::string> keys;
-    std::vector<V3> S, Z;
-    sync.StationsForDump(keys, S);
+    std::vector<V3> S, Sz;
+    sync.StationsForDumpZ(keys, S, Sz);
     for (size_t i = 0; i < keys.size(); i++) fprintf(g_ray_dump, "S %s %.6f %.6f %.6f\n", keys[i].c_str(), S[i].x, S[i].y, S[i].z);
+    for (size_t i = 0; i < keys.size(); i++) fprintf(g_ray_dump, "A %s %.6f %.6f %.6f\n", keys[i].c_str(), Sz[i].x, Sz[i].y, Sz[i].z);
     fprintf(g_ray_dump, "X %.6f %.6f %.6f %.6f %.5f\n", st.x[0] * kDeg, st.x[1], st.x[2], st.x[3], st.expo);
     fclose(g_ray_dump);
   }
